@@ -1,4 +1,4 @@
-# Mechanics of Lithium Dendrites
+# Mechanics of Lithium Dendrites I (Elasticity Coupled Phase Field Model)
 
 
 
