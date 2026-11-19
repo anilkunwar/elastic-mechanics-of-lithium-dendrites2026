@@ -188,7 +188,8 @@
     # Updated: replaced single 'nu' with phase-specific 'num' (Li metal), 'nue' (liquid), 'nuf' (solid LLZO)
     prop_names = 'Emo Eeo Efo num nue nuf V1 V2 V3'
     # Values: Em=4.9 GPa, Ee=0.982 GPa, Ef=300 GPa, num=0.381, nue=0.499, nuf=0.25, V1, V2, V3
-    prop_values = '4.9 0.982 300 0.381 0.499 0.25 -0.866e-3 -0.773e-3 -0.529e-3'
+    prop_values = '4.9 0.982 155 0.381 0.499 0.25 -0.866e-3 -0.773e-3 -0.529e-3'
+    # prop_values = '4.9 0.982 300 0.381 0.499 0.25 -0.866e-3 -0.773e-3 -0.529e-3'
   [../]
   [./nu_eff]
     type = ParsedMaterial
