@@ -4,9 +4,7 @@
 Dendrite-Structure-Geometry Concept Graph v8.0 + QDWA + Graph-RAG + ML
 ================================================================================
 Single-file multimodal knowledge-graph application for lithium-dendrite
-suppression research, architected identically to the UAV Drone codebase
-("Battery Optimization in Drone Systems Concept Graph v6.2 + QDWA")
-but with full ML / GraphSAGE / Latent-MoE / distillation / validation parity.
+suppression research with full ML / GraphSAGE / Latent-MoE / distillation / validation parity.
 
 Three evidence streams fused into one NetworkX DiGraph:
     Stream 1 : manuscript CSV ground truth (6 phase-field models A-F)
