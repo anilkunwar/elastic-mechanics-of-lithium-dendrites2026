@@ -129,6 +129,60 @@ except ImportError:
     AutoProcessor = None
     AutoModelForVision2Seq = None
 
+# --- Ollama backend (local model server) ---
+try:
+    import ollama
+    from ollama import chat as ollama_chat
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    ollama = None
+    OLLAMA_AVAILABLE = False
+
+
+# ============================================================================
+# OLLAMA BACKEND HELPERS
+# ============================================================================
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _check_ollama_available() -> Dict[str, Any]:
+    """Check if Ollama server is running and which models are pulled locally.
+    Returns {'running': bool, 'models': {tag: size_gb, ...}, 'error': str|None}
+    """
+    result: Dict[str, Any] = {"running": False, "models": {}, "error": None}
+    if not OLLAMA_AVAILABLE:
+        result["error"] = "`ollama` Python package not installed (pip install ollama)"
+        return result
+    try:
+        client = ollama.Client(host=OLLAMA_BASE_URL)
+        resp = client.list()
+        # ollama>=0.4 returns a ListResponse; older versions return a dict
+        models = getattr(resp, "models", None) or resp.get("models", [])
+        for m in models:
+            tag = getattr(m, "model", None) or m.get("name", "")
+            size_bytes = getattr(m, "size", 0) or m.get("size", 0)
+            size_gb = round(size_bytes / (1024 ** 3), 2)
+            result["models"][tag] = size_gb
+        result["running"] = True
+    except Exception as e:
+        result["error"] = f"Ollama server unreachable at {OLLAMA_BASE_URL}: {e}"
+    return result
+
+
+def _ollama_has_model(tag: str) -> bool:
+    """Check if a specific Ollama model tag is pulled locally."""
+    info = _check_ollama_available()
+    if not info["running"]:
+        return False
+    # Ollama tags are case-insensitive; match with or without ':latest'
+    pulled = {m.lower() for m in info["models"].keys()}
+    return tag.lower() in pulled or f"{tag}:latest".lower() in pulled
+
+
+def _ollama_size_gb(tag: str) -> float:
+    info = _check_ollama_available()
+    return info["models"].get(tag, 0.0)
+
 
 # ============================================================================
 # PERFORMANCE MONITORING DECORATOR
@@ -8275,6 +8329,81 @@ class LocalLLMQueryAnalyzer(LLMQueryAnalyzer):
             torch.cuda.empty_cache()
 
 
+# ============================================================================
+# v6.4 — OLLAMA BACKEND QUERY ANALYZER (text-only LLMs)
+# ----------------------------------------------------------------------------
+# Calls a local Ollama server (default: http://localhost:11434) for any text
+# LLM already pulled via `ollama pull <tag>`.  No VRAM management needed —
+# Ollama handles GPU/CPU offloading internally.  Falls back gracefully to
+# `FallbackAnalyzer` if the server is down or the model is not pulled.
+# ============================================================================
+class OllamaQueryAnalyzer(LLMQueryAnalyzer):
+    """LLM analyzer backed by a local Ollama server.
+    Uses the `ollama` Python client to call models already pulled on the
+    host machine.  No VRAM management needed — Ollama handles it.
+    """
+    def __init__(self, model_tag: str):
+        self.model_tag = model_tag
+        self._pending_new_concepts: List[Any] = []
+        self._pending_new_relationships: List[Any] = []
+
+    def is_available(self) -> bool:
+        if not OLLAMA_AVAILABLE:
+            return False
+        return _ollama_has_model(self.model_tag)
+
+    def analyze_query(self, query: str, ontology: Any) -> QueryAnalysisResult:
+        if not self.is_available():
+            st.warning(
+                f"⚠️ Ollama model `{self.model_tag}` is not pulled locally. "
+                f"Run: `ollama pull {self.model_tag}`"
+            )
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        prompt = (
+            "You are an expert in dendrite growth in partitioned electrolytes "
+            "(phase-field modeling of lithium-metal electrodes with solid partitions). "
+            f"Analyze: '{query}'. Return ONLY valid JSON with:\n"
+            "  primary_problem (one of geometry_impact, phase_properties, "
+            "electrochemical_kinetics, mechanical_suppression, general, multi_problem),\n"
+            "  explicitly_mentioned (snake_case list of canonical concepts),\n"
+            "  inferred_concepts (list),\n"
+            "  query_type (causal|comparison|solution|definition|general),\n"
+            "  highlight_paths (list of [src, tgt]),\n"
+            "  reasoning_chain (list of strings).\n"
+        )
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            response = client.chat(
+                model=self.model_tag,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.1, "num_predict": 1500},
+                format="json",
+            )
+            content = response["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                # Reuse OpenAI result-builder for consistency
+                fake_openai = OpenAIQueryAnalyzer()
+                fake_openai._pending_new_concepts = parsed.get("new_concepts", [])
+                fake_openai._pending_new_relationships = parsed.get("new_relationships", [])
+                return fake_openai.analyze_query(query, ontology)
+            else:
+                st.warning("Ollama response did not contain JSON; falling back.")
+        except Exception as e:
+            st.warning(f"Ollama call failed: {e}")
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+    def unload_model(self) -> None:
+        # Ollama manages its own memory; ask it to unload this model.
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            client.generate(model=self.model_tag, keep_alive=0)
+        except Exception:
+            pass
+
+
 class VLMQueryAnalyzer(LLMQueryAnalyzer):
     """
     Multimodal (Vision-Language) query analyzer.
@@ -8681,6 +8810,125 @@ class MultiImageVLMQueryAnalyzer(VLMQueryAnalyzer):
                 torch.cuda.empty_cache()
 
         return FallbackAnalyzer().analyze_query(query, ontology)
+
+
+# ============================================================================
+# v6.4 — OLLAMA BACKEND VLM ANALYZER (vision-language models)
+# ----------------------------------------------------------------------------
+# Multimodal analyzer backed by a local Ollama server.  Supports InternVL,
+# Qwen-VL, and any other multimodal model pulled via `ollama pull`.
+# Accepts up to 6 images with captions + LaTeX context.  Falls back to
+# `FallbackAnalyzer` if the server is down or the model is not pulled.
+# ============================================================================
+class OllamaVLMQueryAnalyzer(LLMQueryAnalyzer):
+    """Vision-Language analyzer backed by a local Ollama server.
+    Supports InternVL, Qwen-VL, and any other multimodal model pulled via
+    `ollama pull`.  Accepts up to 6 images with captions + LaTeX context.
+    """
+    def __init__(self, model_tag: str, max_images: int = 6):
+        self.model_tag = model_tag
+        self.max_images = max_images
+        self._pending_new_concepts: List[Any] = []
+        self._pending_new_relationships: List[Any] = []
+
+    def is_available(self) -> bool:
+        if not OLLAMA_AVAILABLE:
+            return False
+        return _ollama_has_model(self.model_tag)
+
+    def analyze_query(
+        self,
+        query: str,
+        ontology: Any,
+        image_inputs: Any = None,
+        image_captions: Any = None,
+        latex_text: str = "",
+    ) -> "QueryAnalysisResult":
+        if not self.is_available():
+            st.warning(
+                f"⚠️ Ollama VLM `{self.model_tag}` not pulled locally. "
+                f"Run: `ollama pull {self.model_tag}`"
+            )
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        # Normalize image inputs
+        if image_inputs is None:
+            image_inputs = []
+        if isinstance(image_inputs, Image.Image):
+            image_inputs = [image_inputs]
+        image_inputs = list(image_inputs)[: self.max_images]
+
+        if image_captions is None:
+            image_captions = [f"Figure {i+1}" for i in range(len(image_inputs))]
+        image_captions = list(image_captions)[: len(image_inputs)]
+        while len(image_captions) < len(image_inputs):
+            image_captions.append(f"Figure {len(image_captions)+1}")
+
+        # Build multimodal prompt
+        system_prompt = (
+            "You are an expert in dendrite growth in partitioned electrolytes. "
+            "Analyze the provided figures, captions, LaTeX context, and query. "
+            "Return ONLY valid JSON with: primary_problem, explicitly_mentioned "
+            "(snake_case), inferred_concepts, query_type, highlight_paths "
+            "(list of [src,tgt]), reasoning_chain, model_descriptions "
+            "(dict Model A..F -> 1-2 sentence description)."
+        )
+        user_text = f"User Query: {query}\n"
+        for img, cap in zip(image_inputs, image_captions):
+            user_text += f"[{cap}]\n"
+        if latex_text.strip():
+            user_text += f"LaTeX/Text Context:\n{latex_text[:4000]}\n"
+        user_text += "\nReturn ONLY valid JSON."
+
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            # Ollama accepts base64-encoded images (or numpy arrays / PIL)
+            # The `ollama` Python client accepts PIL images directly.
+            response = client.chat(
+                model=self.model_tag,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text, "images": image_inputs or None},
+                ],
+                options={"temperature": 0.1, "num_predict": 1500},
+                format="json",
+            )
+            content = response["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                # Reuse VLM result builder
+                base = FallbackAnalyzer().analyze_query(query, ontology)
+                problem_map = {
+                    "geometry_impact": BatteryProblem.GEOMETRY_IMPACT,
+                    "phase_properties": BatteryProblem.PHASE_PROPERTIES,
+                    "electrochemical_kinetics": BatteryProblem.ELECTROCHEMICAL_KINETICS,
+                    "mechanical_suppression": BatteryProblem.MECHANICAL_SUPPRESSION,
+                    "general": BatteryProblem.GENERAL,
+                    "multi_problem": BatteryProblem.MULTI_PROBLEM,
+                }
+                raw_problem = (parsed.get("primary_problem") or "").strip().lower()
+                if raw_problem in problem_map:
+                    base.primary_problem = problem_map[raw_problem]
+                base.explicitly_mentioned = parsed.get("explicitly_mentioned", []) or []
+                base.inferred_concepts = parsed.get("inferred_concepts", []) or []
+                base.query_type = parsed.get("query_type", "general")
+                base.reasoning_chain = parsed.get("reasoning_chain", []) or []
+                self._pending_new_concepts = parsed.get("new_concepts", []) or []
+                self._pending_new_relationships = parsed.get("new_relationships", []) or []
+                model_desc = parsed.get("model_descriptions", {}) or {}
+                setattr(base, "model_descriptions", model_desc)
+                return base
+        except Exception as e:
+            st.warning(f"Ollama VLM call failed: {e}")
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+    def unload_model(self) -> None:
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            client.generate(model=self.model_tag, keep_alive=0)
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -10049,9 +10297,24 @@ class LLMQueryAnalyzerFactory:
     def __init__(self):
         self._openai_cache: Optional[OpenAIQueryAnalyzer] = None
         self._local_cache: Dict[str, LocalLLMQueryAnalyzer] = {}
+        self._ollama_cache: Dict[str, OllamaQueryAnalyzer] = {}
         self._fallback = FallbackAnalyzer()
 
-    def get_analyzer(self, mode: str = "auto", api_key: str = None, local_model: str = None) -> LLMQueryAnalyzer:
+    def get_analyzer(
+        self,
+        mode: str = "auto",
+        api_key: str = None,
+        local_model: str = None,
+        backend: str = None,
+    ) -> LLMQueryAnalyzer:
+        # v6.4: explicit Ollama backend shortcut.
+        if backend == "ollama" and local_model:
+            if local_model not in self._ollama_cache:
+                self._ollama_cache[local_model] = OllamaQueryAnalyzer(
+                    model_tag=local_model
+                )
+            return self._ollama_cache[local_model]
+
         if mode == "openai":
             if self._openai_cache is None:
                 self._openai_cache = OpenAIQueryAnalyzer(api_key=api_key)
@@ -10060,12 +10323,35 @@ class LLMQueryAnalyzerFactory:
             model = local_model
             if model is None:
                 return self._fallback
+            # Auto-detect if this is an Ollama tag (no slash, looks like "name:tag")
+            if (
+                backend is None
+                and OLLAMA_AVAILABLE
+                and "/" not in model
+                and ":" in model
+                and _ollama_has_model(model)
+            ):
+                if model not in self._ollama_cache:
+                    self._ollama_cache[model] = OllamaQueryAnalyzer(model_tag=model)
+                return self._ollama_cache[model]
             if model not in self._local_cache:
                 self._local_cache[model] = LocalLLMQueryAnalyzer(model)
             return self._local_cache[model]
         elif mode == "fallback":
             return self._fallback
         else:  # auto
+            # Prefer Ollama if running and a model is selected
+            if (
+                OLLAMA_AVAILABLE
+                and _check_ollama_available()["running"]
+                and local_model
+            ):
+                if _ollama_has_model(local_model):
+                    if local_model not in self._ollama_cache:
+                        self._ollama_cache[local_model] = OllamaQueryAnalyzer(
+                            model_tag=local_model
+                        )
+                    return self._ollama_cache[local_model]
             if self._openai_cache is None:
                 self._openai_cache = OpenAIQueryAnalyzer(api_key=api_key)
             if self._openai_cache.is_available():
@@ -10857,95 +11143,160 @@ def render_llm_query_panel(ontology: Any, expander: DynamicOntologyExpander, ful
         api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password", value=os.environ.get("OPENAI_API_KEY", ""), key="openai_key_input")
 
     local_model = None
-    if mode in ("auto", "local"):
-        st.sidebar.markdown("#### 🖥️ Local LLM Model")
-        st.sidebar.caption(
-            "⚠️ Small models (≤1.5B) run anywhere; Qwen3-30B-A3B / 32B need "
-            "≈18–22 GB VRAM at 4-bit NF4 (fits a 24 GB card)."
+    # ---------- Check Ollama status ONCE per render ----------
+    ollama_info = _check_ollama_available()
+    if ollama_info["running"]:
+        st.sidebar.success(
+            f"✅ Ollama server running — {len(ollama_info['models'])} model(s) available"
         )
-        LOCAL_LLM_REGISTRY = {
-            # --- Rule-based (no GPU required) ---
-            "Fallback (Rule-based, no LLM)": None,
-
-            # --- Sub-1B / CPU-friendly models ---
-            "DistilGPT-2 (82M, fastest)": "distilgpt2",
-            "GPT-Neo-125M (125M)": "EleutherAI/gpt-neo-125M",
-            "Pythia-410M (410M, balanced)": "EleutherAI/pythia-410m",
-            "BLOOM-560M (560M, multilingual)": "bigscience/bloom-560m",
-            "Qwen2-0.5B-Instruct (500M, best JSON)": "Qwen/Qwen2-0.5B-Instruct",
-            "Qwen2.5-0.5B-Instruct (500M, newest)": "Qwen/Qwen2.5-0.5B-Instruct",
-
-            # --- Mid-size Qwen2.5 instruct models ---
-            "Qwen2.5-7B-Instruct (7.6B, high quality)": "Qwen/Qwen2.5-7B-Instruct",
-            "Qwen2.5-14B-Instruct (15B, balanced quality/VRAM)": "Qwen/Qwen2.5-14B-Instruct",
-
-            # --- Large Qwen3 models (≥30B, 4-bit NF4 quantized) ---
-            # 30B-A3B is a Mixture-of-Experts model: 30B total params but only
-            # ~3B active per token, giving sub-7B inference latency with 30B-class
-            # quality. Matches the local ollama tag `qwen3:30b-a3b`.
-            "Qwen3-30B-A3B-Instruct (MoE 30B/3B active, ~18 GB 4-bit) [ollama: qwen3:30b-a3b]":
-                "Qwen/Qwen3-30B-A3B-Instruct",
-            # Dense 32B Qwen3 instruct model — best non-MoE quality but the
-            # heaviest to run. Matches the local ollama tag `qwen3:32b`.
-            "Qwen3-32B-Instruct (dense 32B, ~20 GB 4-bit) [ollama: qwen3:32b]":
-                "Qwen/Qwen3-32B-Instruct",
-        }
-        model_display_names = list(LOCAL_LLM_REGISTRY.keys())
-        selected_display = st.sidebar.selectbox(
-            "Select model:", options=model_display_names, index=0,
-            key="local_model_select",
+    else:
+        st.sidebar.warning(
+            f"⚠️ Ollama unavailable: {ollama_info.get('error', 'unknown')}"
         )
-        local_model = LOCAL_LLM_REGISTRY[selected_display]
-        st.session_state['selected_local_model'] = local_model
 
-        # Surface the chosen model's rough VRAM footprint so the user knows
-        # what they're committing to before clicking "Analyze".
-        if local_model is None:
-            st.sidebar.caption("🟢 No model — pure rule-based fallback.")
-        elif "Qwen3-32B" in local_model:
-            st.sidebar.caption("🔴 ~20 GB VRAM at 4-bit NF4 (24 GB card recommended).")
-        elif "Qwen3-30B-A3B" in local_model:
-            st.sidebar.caption("🟠 ~18 GB VRAM at 4-bit NF4 (MoE — fast inference).")
-        elif "14B" in local_model:
-            st.sidebar.caption("🟡 ~10 GB VRAM at 4-bit NF4.")
-        elif "7B" in local_model:
-            st.sidebar.caption("🟢 ~6 GB VRAM at 4-bit NF4.")
+    st.sidebar.markdown("#### 🖥️ Local LLM Model")
+    st.sidebar.caption(
+        "🟢/🟡 Ollama models auto-detected from local server.  "
+        "🔵 HuggingFace direct-load models require ~4-bit NF4 VRAM."
+    )
+
+    # ---------- LLM REGISTRY (text-only) ----------
+    LOCAL_LLM_REGISTRY = {
+        # ---- Rule-based (no GPU) ----
+        "Fallback (Rule-based, no LLM)":
+            {"backend": "fallback", "tag": None, "size_gb": 0},
+
+        # ---- Ollama: Sub-1B ----
+        "🟢 [Ollama] qwen2.5:0.5b (397 MB)":
+            {"backend": "ollama", "tag": "qwen2.5:0.5b", "size_gb": 0.39},
+
+        # ---- Ollama: 1–3B ----
+        "🟢 [Ollama] qwen2.5:1.5b (986 MB)":
+            {"backend": "ollama", "tag": "qwen2.5:1.5b", "size_gb": 0.96},
+        "🟢 [Ollama] qwen2.5:3b (1.9 GB)":
+            {"backend": "ollama", "tag": "qwen2.5:3b", "size_gb": 1.9},
+
+        # ---- Ollama: 4–8B ----
+        "🟢 [Ollama] qwen2.5:7b (4.7 GB)":
+            {"backend": "ollama", "tag": "qwen2.5:7b", "size_gb": 4.7},
+        "🟢 [Ollama] llama3:latest (4.7 GB)":
+            {"backend": "ollama", "tag": "llama3:latest", "size_gb": 4.7},
+
+        # ---- Ollama: 9–15B ----
+        "🟡 [Ollama] qwen2.5:14b (9.0 GB)":
+            {"backend": "ollama", "tag": "qwen2.5:14b", "size_gb": 9.0},
+
+        # ---- HuggingFace direct-load (existing) ----
+        "🔵 [HF] DistilGPT-2 (82M, fastest)":
+            {"backend": "hf", "tag": "distilgpt2", "size_gb": 0.3},
+        "🔵 [HF] Qwen2.5-0.5B-Instruct (500M, best JSON)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-0.5B-Instruct", "size_gb": 1.0},
+        "🔵 [HF] Qwen2.5-7B-Instruct (7.6B, high quality)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-7B-Instruct", "size_gb": 5.0},
+        "🔵 [HF] Qwen2.5-14B-Instruct (15B, balanced)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-14B-Instruct", "size_gb": 9.0},
+        "🟠 [HF] Qwen3-30B-A3B-Instruct (MoE 30B/3B active, ~18 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-30B-A3B-Instruct", "size_gb": 18.0},
+        "🔴 [HF] Qwen3-32B-Instruct (dense 32B, ~20 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-32B-Instruct", "size_gb": 20.0},
+    }
+
+    # ---------- LLM model dropdown ----------
+    llm_display_names = list(LOCAL_LLM_REGISTRY.keys())
+    # Default to first Ollama model if available, else fallback
+    default_idx = 0
+    if ollama_info["running"]:
+        for i, name in enumerate(llm_display_names):
+            if "[Ollama]" in name:
+                default_idx = i
+                break
+
+    selected_display = st.sidebar.selectbox(
+        "Select LLM model:", options=llm_display_names, index=default_idx,
+        key="local_model_select",
+    )
+    selected_entry = LOCAL_LLM_REGISTRY[selected_display]
+    backend = selected_entry["backend"]
+    model_tag = selected_entry["tag"]
+
+    # Show availability badge
+    if backend == "ollama":
+        if _ollama_has_model(model_tag):
+            st.sidebar.success(f"✅ `{model_tag}` pulled locally ({selected_entry['size_gb']:.1f} GB)")
         else:
-            st.sidebar.caption("🟢 CPU-runnable (sub-1B params).")
+            st.sidebar.error(f"❌ `{model_tag}` NOT pulled — run: `ollama pull {model_tag}`")
+    elif backend == "hf":
+        st.sidebar.caption(f"🔵 HuggingFace direct-load (~{selected_entry['size_gb']:.0f} GB VRAM at 4-bit)")
+    else:
+        st.sidebar.caption("🟢 Pure rule-based fallback (no model needed)")
 
-    # === VLM model selection (for image + LaTeX/text multimodal analysis) ===
-    # The Qwen3-VL-30B/32B variants are surfaced here so the user can pick the
-    # larger models that are already pulled locally via `ollama pull
-    # qwen3-vl:30b` / `qwen3-vl:32b`. Loading uses 4-bit NF4 quantization so
-    # they fit on a 24 GB GPU (~19–20 GB), with the smaller 7B variant kept
-    # as the default for fast iteration.
+    # Preserve backwards-compat: legacy code reads `local_model` (the HF id)
+    # and `st.session_state['selected_local_model']`.  New code also stores
+    # the backend so the routing block can dispatch correctly.
+    local_model = model_tag
+    st.session_state['selected_local_model'] = model_tag
+    st.session_state['selected_local_backend'] = backend
+
+    # ---------- VLM model dropdown ----------
     st.sidebar.markdown("#### 👁️ VLM Model (Vision-Language)")
     st.sidebar.caption(
-        "Used when an image and/or LaTeX notes are attached below. Larger "
-        "Qwen3-VL variants give better chart/microstructure parsing but need "
-        "≈19–20 GB VRAM at 4-bit NF4."
+        "Used when an image and/or LaTeX notes are attached below.  "
+        "🟢 Ollama VLMs auto-detected; 🔵 HF VLMs require ~4-bit NF4 VRAM."
     )
+
+    # ---------- VLM REGISTRY (vision + text) ----------
     LOCAL_VLM_REGISTRY = {
-        "Qwen2.5-VL-7B-Instruct (7B, ~6 GB 4-bit) [ollama: qwen2.5-vl:7b]":
-            "Qwen/Qwen2.5-VL-7B-Instruct",
-        "Qwen3-VL-30B-Instruct (~19 GB 4-bit) [ollama: qwen3-vl:30b]":
-            "Qwen/Qwen3-VL-30B-Instruct",
-        "Qwen3-VL-32B-Instruct (~20 GB 4-bit) [ollama: qwen3-vl:32b]":
-            "Qwen/Qwen3-VL-32B-Instruct",
+        # ---- Ollama VLMs: small ----
+        "🟢 [Ollama] qwen3-vl:2b (1.9 GB)":
+            {"backend": "ollama", "tag": "qwen3-vl:2b", "size_gb": 1.9},
+        "🟢 [Ollama] qwen2.5vl:3b (3.2 GB)":
+            {"backend": "ollama", "tag": "qwen2.5vl:3b", "size_gb": 3.2},
+
+        # ---- Ollama VLMs: medium ----
+        "🟢 [Ollama] qwen3-vl:4b (3.3 GB)":
+            {"backend": "ollama", "tag": "qwen3-vl:4b", "size_gb": 3.3},
+        "🟢 [Ollama] blaifa/InternVL3_5:8b (5.7 GB)":
+            {"backend": "ollama", "tag": "blaifa/InternVL3_5:8b", "size_gb": 5.7},
+        "🟢 [Ollama] qwen2.5vl:7b (6.0 GB)":
+            {"backend": "ollama", "tag": "qwen2.5vl:7b", "size_gb": 6.0},
+
+        # ---- HuggingFace direct-load VLMs (existing) ----
+        "🔵 [HF] Qwen2.5-VL-7B-Instruct (~6 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-VL-7B-Instruct", "size_gb": 6.0},
+        "🟠 [HF] Qwen3-VL-30B-Instruct (~19 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-VL-30B-Instruct", "size_gb": 19.0},
+        "🔴 [HF] Qwen3-VL-32B-Instruct (~20 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-VL-32B-Instruct", "size_gb": 20.0},
     }
+
     vlm_display_names = list(LOCAL_VLM_REGISTRY.keys())
+    default_vlm_idx = 0
+    if ollama_info["running"]:
+        for i, name in enumerate(vlm_display_names):
+            if "[Ollama]" in name:
+                default_vlm_idx = i
+                break
+
     selected_vlm_display = st.sidebar.selectbox(
-        "Select VLM model:", options=vlm_display_names, index=0,
+        "Select VLM model:", options=vlm_display_names, index=default_vlm_idx,
         key="vlm_model_select",
     )
-    selected_vlm_model = LOCAL_VLM_REGISTRY[selected_vlm_display]
-    st.session_state['selected_vlm_model'] = selected_vlm_model
-    if "Qwen3-VL-32B" in selected_vlm_model:
-        st.sidebar.caption("🔴 ~20 GB VRAM at 4-bit NF4 (24 GB card recommended).")
-    elif "Qwen3-VL-30B" in selected_vlm_model:
-        st.sidebar.caption("🟠 ~19 GB VRAM at 4-bit NF4.")
+    vlm_entry = LOCAL_VLM_REGISTRY[selected_vlm_display]
+    vlm_backend = vlm_entry["backend"]
+    vlm_tag = vlm_entry["tag"]
+
+    if vlm_backend == "ollama":
+        if _ollama_has_model(vlm_tag):
+            st.sidebar.success(f"✅ `{vlm_tag}` pulled locally ({vlm_entry['size_gb']:.1f} GB)")
+        else:
+            st.sidebar.error(f"❌ `{vlm_tag}` NOT pulled — run: `ollama pull {vlm_tag}`")
     else:
-        st.sidebar.caption("🟢 ~6 GB VRAM at 4-bit NF4 (default, fast).")
+        st.sidebar.caption(f"🔵 HuggingFace direct-load (~{vlm_entry['size_gb']:.0f} GB VRAM at 4-bit)")
+
+    # Preserve legacy session-state key for downstream code; also store backend.
+    selected_vlm_model = vlm_tag
+    st.session_state['selected_vlm_model'] = vlm_tag
+    st.session_state['selected_vlm_backend'] = vlm_backend
 
     # === v6.3: Multi-image + LaTeX/text + physics-JSON uploaders =========
     st.sidebar.markdown("#### 📎 Attach Context (Optional)")
@@ -11045,29 +11396,62 @@ def render_llm_query_panel(ontology: Any, expander: DynamicOntologyExpander, ful
     # v6.3: Multi-image path uses `MultiImageVLMQueryAnalyzer` instead of the
     # single-image `VLMQueryAnalyzer`.  Single-image callers still work via
     # backwards-compatible kwargs.
+    # v6.4: Ollama VLMs use `OllamaVLMQueryAnalyzer`; HF VLMs use
+    # `MultiImageVLMQueryAnalyzer`.  Selection is driven by the
+    # `selected_vlm_backend` session-state key set in the dropdown above.
     use_vlm = bool(image_inputs) or bool(latex_context.strip())
     if use_vlm:
-        vlm_model_id = st.session_state.get(
+        vlm_backend_sel = st.session_state.get('selected_vlm_backend', 'hf')
+        vlm_tag_sel = st.session_state.get(
             'selected_vlm_model', "Qwen/Qwen2.5-VL-7B-Instruct"
         )
-        vlm_display_label = next(
-            (k for k, v in LOCAL_VLM_REGISTRY.items() if v == vlm_model_id),
-            vlm_model_id,
-        )
+        # Find the human-readable label for the sidebar info box.
+        vlm_display_label = vlm_tag_sel
+        for _lbl, _entry in LOCAL_VLM_REGISTRY.items():
+            if _entry.get("tag") == vlm_tag_sel:
+                vlm_display_label = _lbl
+                break
         n_imgs = len(image_inputs)
-        st.sidebar.info(
-            f"👁️ Using **Multi-Image VLM** for multimodal analysis:\n\n"
-            f"{vlm_display_label}\n"
-            f"Figures attached: **{n_imgs}** (cap 6)"
-        )
-        analyzer = MultiImageVLMQueryAnalyzer(model_name=vlm_model_id, max_images=6)
+        if vlm_backend_sel == "ollama":
+            st.sidebar.info(
+                f"👁️ Using **Ollama VLM** for multimodal analysis:\n\n"
+                f"{vlm_display_label}\n"
+                f"Figures attached: **{n_imgs}** (cap 6)"
+            )
+            analyzer = OllamaVLMQueryAnalyzer(model_tag=vlm_tag_sel, max_images=6)
+        else:
+            st.sidebar.info(
+                f"👁️ Using **HF VLM** for multimodal analysis:\n\n"
+                f"{vlm_display_label}\n"
+                f"Figures attached: **{n_imgs}** (cap 6)"
+            )
+            analyzer = MultiImageVLMQueryAnalyzer(model_name=vlm_tag_sel, max_images=6)
     else:
-        analyzer = factory.get_analyzer(mode=mode, api_key=api_key, local_model=local_model)
+        llm_backend_sel = st.session_state.get('selected_local_backend', 'fallback')
+        llm_tag_sel = st.session_state.get('selected_local_model')
+        if llm_backend_sel == "ollama" and llm_tag_sel:
+            st.sidebar.info(f"🖥️ Using **Ollama LLM**: `{llm_tag_sel}`")
+            analyzer = OllamaQueryAnalyzer(model_tag=llm_tag_sel)
+        elif llm_backend_sel == "hf" and llm_tag_sel:
+            st.sidebar.info(f"🖥️ Using **HF LLM**: `{llm_tag_sel}`")
+            analyzer = factory.get_analyzer(
+                mode="local", api_key=api_key, local_model=llm_tag_sel
+            )
+        else:
+            # Honor the explicit top-of-sidebar "Analysis Engine" mode when
+            # no LLM backend is set (e.g. mode='openai' or mode='fallback').
+            analyzer = factory.get_analyzer(
+                mode=mode, api_key=api_key, local_model=local_model
+            )
 
-    if isinstance(analyzer, OpenAIQueryAnalyzer):
+    if isinstance(analyzer, OllamaQueryAnalyzer):
+        pass  # Already announced above.
+    elif isinstance(analyzer, OllamaVLMQueryAnalyzer):
+        pass  # Already announced above.
+    elif isinstance(analyzer, OpenAIQueryAnalyzer):
         st.sidebar.info("🤖 Using **OpenAI GPT-4o-mini**")
     elif isinstance(analyzer, LocalLLMQueryAnalyzer):
-        st.sidebar.info("🖥️ Using **Local LLM**")
+        st.sidebar.info("🖥️ Using **Local LLM (HF)**")
     elif isinstance(analyzer, MultiImageVLMQueryAnalyzer):
         pass  # Already announced above.
     elif isinstance(analyzer, VLMQueryAnalyzer):
@@ -11077,10 +11461,10 @@ def render_llm_query_panel(ontology: Any, expander: DynamicOntologyExpander, ful
 
     with st.sidebar.spinner("Analyzing query (VLM/LLM)..."):
         # Pass multi-image list + captions + LaTeX context through when the
-        # analyzer accepts them (MultiImageVLMQueryAnalyzer); plain text-only
-        # analyzers ignore the kwargs.
+        # analyzer accepts them (MultiImageVLMQueryAnalyzer /
+        # OllamaVLMQueryAnalyzer); plain text-only analyzers ignore the kwargs.
         try:
-            if isinstance(analyzer, MultiImageVLMQueryAnalyzer):
+            if isinstance(analyzer, (MultiImageVLMQueryAnalyzer, OllamaVLMQueryAnalyzer)):
                 analysis = analyzer.analyze_query(
                     query, ontology,
                     image_inputs=image_inputs,
