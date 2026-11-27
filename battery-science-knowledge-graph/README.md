@@ -18,3 +18,6 @@ Knowledge Graph:
 
 [![meaningtowords](https://img.shields.io/badge/dendritescg6-v6.0-red)](https://dendrite-structure-properties-concept-graph6.streamlit.app/) (Advanced model with VLM and SFT information.  Code has provisions for models with Nparameters > 15B. Model will run in local computer. User supplied information such as of specific geometry and material properties of electrode and hybrid electrolyte is coupled with the literature grounded truth. The user supplied information corresponds to the exact values mentioned in the current phase field model.  )
 
+[![meaningtowords](https://img.shields.io/badge/dendritescg6a-v6.a-red)](https://dendrite-structure-properties-concept-graph6a.streamlit.app/) (Advanced model with VLM and SFT information.  Code has provisions for models with Nparameters > 15B. Model will run in local computer. User supplied information such as of specific geometry and material properties of electrode and hybrid electrolyte is coupled with the literature grounded truth. The user supplied information corresponds to the exact values mentioned in the current phase field model. Improvement of the Numerical Models Physics Part with Validation of the Values on Von Mises Stress and Dendrite Branching Probability.)
+
+
