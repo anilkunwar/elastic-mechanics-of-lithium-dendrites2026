@@ -22,5 +22,9 @@ Knowledge Graph:
 
 [![meaningtowords](https://img.shields.io/badge/dendritescg6b-v6.b-red)](https://dendrite-structure-properties-concept-graph6b.streamlit.app/) (Advanced model with VLM and SFT information.  Code has provisions for models with Nparameters > 15B. Model will run in local computer. User supplied information such as of specific geometry and material properties of electrode and hybrid electrolyte is coupled with the literature grounded truth. The user supplied information corresponds to the exact values mentioned in the current phase field model. Improvement of the Numerical Models Physics Part with Validation of the Values on Von Mises Stress and Dendrite Branching Probability. The Physics Similarity computation excludes the Categorical Features - Geometry and Side Branching Probability, and the constant Features - Overpotential and E_solid. More figures added on the Numerical Models Physics section.)
 
+[![meaningtowords](https://img.shields.io/badge/dendritescg6b-v6.c-red)](https://dendrite-structure-properties-concept-graph6c.streamlit.app/) (Advanced model with VLM and SFT information.  Code has provisions for models with Nparameters > 15B. Model will run in local computer. User supplied information such as of specific geometry and material properties of electrode and hybrid electrolyte is coupled with the literature grounded truth. The user supplied information corresponds to the exact values mentioned in the current phase field model. Improvement of the Numerical Models Physics Part with Validation of the Values on Von Mises Stress and Dendrite Branching Probability. The Physics Similarity computation excludes the Categorical Features - Geometry and Side Branching Probability, and the constant Features - Overpotential and E_solid. More figures added on the Numerical Models Physics section.)
+
+
+
 
 
