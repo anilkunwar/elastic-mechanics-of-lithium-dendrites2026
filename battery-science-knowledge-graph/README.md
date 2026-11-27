@@ -6,5 +6,7 @@ Csv to Json Conversion
 
 Knowledge Graph:
 
-[![meaningtowords](https://img.shields.io/badge/dendritescg1-v1.0-orange)](https://dendrite-structure-properties-concept-graph1.streamlit.app/) (OOM issue in streamlit cloud )
+[![meaningtowords](https://img.shields.io/badge/dendritescg1-v1.0-green)](https://dendrite-structure-properties-concept-graph1.streamlit.app/) (OOM issue in streamlit cloud )
+
+[![meaningtowords](https://img.shields.io/badge/dendritescg1-v2.0-blue)](https://dendrite-structure-properties-concept-graph2.streamlit.app/) (basic model without VLM and SFT information )
 
