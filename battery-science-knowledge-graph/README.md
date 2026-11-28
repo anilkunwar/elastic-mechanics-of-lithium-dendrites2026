@@ -24,6 +24,10 @@ Knowledge Graph:
 
 [![meaningtowords](https://img.shields.io/badge/dendritescg6b-v6.c-red)](https://dendrite-structure-properties-concept-graph6c.streamlit.app/) (Advanced model with VLM and SFT information.  Code has provisions for models with Nparameters > 15B. Model will run in local computer. User supplied information such as of specific geometry and material properties of electrode and hybrid electrolyte is coupled with the literature grounded truth. The user supplied information corresponds to the exact values mentioned in the current phase field model. Improvement of the Numerical Models Physics Part with Validation of the Values on Von Mises Stress and Dendrite Branching Probability. The Physics Similarity computation excludes the Categorical Features - Geometry and Side Branching Probability, and the constant Features - Overpotential and E_solid. More figures added on the Numerical Models Physics section.)
 
+r7: More LLMs 
+
+[![meaningtowords](https://img.shields.io/badge/dendritescg6b-v7.c-red)](https://dendrite-structure-properties-concept-graph7.streamlit.app/) (Advanced model with VLM and SFT information.  Code has provisions for models with Nparameters > 15B. Model will run in local computer. User supplied information such as of specific geometry and material properties of electrode and hybrid electrolyte is coupled with the literature grounded truth. The user supplied information corresponds to the exact values mentioned in the current phase field model. Improvement of the Numerical Models Physics Part with Validation of the Values on Von Mises Stress and Dendrite Branching Probability. The Physics Similarity computation excludes the Categorical Features - Geometry and Side Branching Probability, and the constant Features - Overpotential and E_solid. More figures added on the Numerical Models Physics section. Maximu Token Limit for VLM-7B: Ollama VLM call failed: {"error":{"code":400,"message":"request (8640 tokens) exceeds the available context size (4096 tokens), try increasing t","type":"exceed_context_size_error","n_prompt_tokens":8640,"n_ctx":4096}} (status code: 400)) )
+
 
 
 
