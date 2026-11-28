@@ -184,6 +184,38 @@ def _ollama_size_gb(tag: str) -> float:
     return info["models"].get(tag, 0.0)
 
 
+def _pil_to_b64(img: "Image.Image", max_side: int = 1024) -> str:
+    """Convert a PIL image to a base64 PNG string for the Ollama API.
+
+    Ollama's `chat()` `images` field only accepts base64 strings (or bytes /
+    paths) — never PIL objects.  We also downscale large figures to keep
+    vision-token usage and VRAM reasonable when 6 figures are attached.
+    """
+    if max_side and max(img.size) > max_side:
+        img = img.copy()
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _ollama_content(response: Any) -> str:
+    """Return the assistant message text from an Ollama chat response.
+
+    Compatible with both dict-style (ollama ≤0.3) and pydantic-style
+    (ollama ≥0.4) client return values.
+    """
+    try:
+        return response["message"]["content"]
+    except (TypeError, KeyError):
+        try:
+            return response.message.content
+        except AttributeError:
+            return ""
+
+
 # ============================================================================
 # PERFORMANCE MONITORING DECORATOR
 # ============================================================================
@@ -8380,7 +8412,7 @@ class OllamaQueryAnalyzer(LLMQueryAnalyzer):
                 options={"temperature": 0.1, "num_predict": 1500},
                 format="json",
             )
-            content = response["message"]["content"]
+            content = _ollama_content(response)
             json_match = re.search(r"\{.*\}", content, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -8882,18 +8914,30 @@ class OllamaVLMQueryAnalyzer(LLMQueryAnalyzer):
 
         try:
             client = ollama.Client(host=OLLAMA_BASE_URL)
-            # Ollama accepts base64-encoded images (or numpy arrays / PIL)
-            # The `ollama` Python client accepts PIL images directly.
+
+            # ---- THE FIX: encode PIL → base64 strings ----
+            # Ollama's `chat()` `images` field only accepts base64 strings
+            # (or bytes / paths), never raw PIL objects.  The previous
+            # implementation passed PIL objects directly, which tripped
+            # pydantic validation in the ollama client and caused every
+            # multimodal query to silently fall back to rule-based.
+            image_b64 = [_pil_to_b64(img) for img in image_inputs]
+
+            message: Dict[str, Any] = {"role": "user", "content": user_text}
+            if image_b64:
+                message["images"] = image_b64      # list of base64 strings
+
             response = client.chat(
                 model=self.model_tag,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text, "images": image_inputs or None},
+                    message,
                 ],
                 options={"temperature": 0.1, "num_predict": 1500},
                 format="json",
             )
-            content = response["message"]["content"]
+            content = _ollama_content(response)
+
             json_match = re.search(r"\{.*\}", content, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -8919,6 +8963,7 @@ class OllamaVLMQueryAnalyzer(LLMQueryAnalyzer):
                 model_desc = parsed.get("model_descriptions", {}) or {}
                 setattr(base, "model_descriptions", model_desc)
                 return base
+            st.warning("Ollama VLM response did not contain JSON; falling back.")
         except Exception as e:
             st.warning(f"Ollama VLM call failed: {e}")
         return FallbackAnalyzer().analyze_query(query, ontology)
