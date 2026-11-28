@@ -1,0 +1,12992 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Dendrite Growth in Partitioned Electrolytes Concept Graph v6.3 + QDWA + Numerical Models
+================================================================================================
+Multi-level reasoning concept graph for dendrite growth in partitioned electrolytes,
+with the Query Distillation & Weighted Allocation (QDWA) strategy fully integrated and the
+specific physics of the six numerical models (A-F) layered on top of the JSON ground-truth.
+Focus: Structural geometry, phase properties, electrochemical kinetics, mechanical constraints,
+       and numerical-model physics (Models A-F: 3 geometries × 2 S/L ratios).
+
+v6.3 patch notes
+----------------
+* NEW: `NUMERICAL_MODELS_PHYSICS` hardcoded dict encoding the canonical physics
+  of the 6 manuscript models (A-F) across all 5 categories:
+  geometry, growth, mechanical, electrochemical, phase-field.
+* NEW: Sidebar uploader for an additional `model_physics_overrides.json` that
+  extends or overrides the hardcoded defaults at runtime (hybrid source).
+* NEW: Models A-F added to `DomainOntology` as `ConceptType.MODEL` nodes with
+  causal edges (`CONSTRAINS`, `DETERMINES`, `SUPPRESSES`, `MODELS`) to their
+  key physics parameters and growth metrics.
+* NEW: QDWA extended from 4 to 5 pillars. `numerical_models` is the 5th category
+  with the six model concepts as seeds. `math.log(4)` is now `math.log(N)` so
+  the concentration index remains well-defined. The 32 LatentMoE experts keep
+  their original 4-category mapping (the 5th pillar acts at the QDWA weight
+  level only).
+* NEW: `MultiImageVLMQueryAnalyzer` accepts up to 6 figures with per-figure
+  captions and 4000-char LaTeX context, replacing the single-image path.
+* NEW: `associate_models_with_abstracts()` computes a 6×N model↔abstract
+  similarity matrix using SentenceTransformer embeddings; a dedicated tab
+  renders the heatmap plus per-model top-abstract listings.
+* NEW: "Numerical Models Physics" tab showing the 6 models' physics as an
+  editable table and a normalized radar chart.
+
+v6.2 patch notes
+----------------
+* Fixes StreamlitAPIException: "st.session_state.<key> cannot be modified after
+  the widget with key=<key> is instantiated."
+* Introduces `_MT_WIDGET_DEFAULTS` + `init_widget_defaults()` which seeds widget
+  keys BEFORE any widget is created. Widget panels (Microtransformer #2, QDWA)
+  no longer write to their own widget-backed session-state keys.
+* `render_microtransformer_postprocessing_panel`, `render_qdwa_customization_panel`
+  use callback-based resets and return their configuration dict directly.
+* `render_qdwa_tab` consumes the panel's returned dict instead of reading the
+  widget-backed key from `st.session_state`.
+"""
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.sparse as sparse
+import torch.optim as optim
+import networkx as nx
+import numpy as np
+import pandas as pd
+import re
+import json
+import math
+import os
+import sys
+import tempfile
+import warnings
+import traceback
+import gc
+import hashlib
+import functools
+import time
+import io
+import base64
+import copy
+from collections import defaultdict, Counter, deque
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple, Union, Any, Set, Iterator
+from pathlib import Path
+from enum import Enum
+from dataclasses import dataclass, field
+from sklearn.linear_model import Ridge
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import (
+    silhouette_score, r2_score, mean_absolute_error,
+    mean_squared_error, davies_bouldin_score, pairwise_distances
+)
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from scipy import stats
+from scipy.stats import pearsonr, spearmanr
+from scipy.spatial.distance import pdist, squareform
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+from sentence_transformers import SentenceTransformer
+from pyvis.network import Network
+import plotly.graph_objects as go
+import plotly.express as px
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+warnings.filterwarnings('ignore')
+
+# --- LLM & Query Analysis imports ---
+from abc import ABC, abstractmethod
+from enum import Enum as PyEnum
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+except ImportError:
+    pipeline = None
+
+# --- VLM (Vision-Language Model) imports ---
+from PIL import Image
+try:
+    from transformers import AutoProcessor, AutoModelForVision2Seq
+except ImportError:
+    AutoProcessor = None
+    AutoModelForVision2Seq = None
+
+# --- Ollama backend (local model server) ---
+try:
+    import ollama
+    from ollama import chat as ollama_chat
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    ollama = None
+    OLLAMA_AVAILABLE = False
+
+
+# ============================================================================
+# OLLAMA BACKEND HELPERS
+# ============================================================================
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _check_ollama_available() -> Dict[str, Any]:
+    """Check if Ollama server is running and which models are pulled locally.
+    Returns {'running': bool, 'models': {tag: size_gb, ...}, 'error': str|None}
+    """
+    result: Dict[str, Any] = {"running": False, "models": {}, "error": None}
+    if not OLLAMA_AVAILABLE:
+        result["error"] = "`ollama` Python package not installed (pip install ollama)"
+        return result
+    try:
+        client = ollama.Client(host=OLLAMA_BASE_URL)
+        resp = client.list()
+        # ollama>=0.4 returns a ListResponse; older versions return a dict
+        models = getattr(resp, "models", None) or resp.get("models", [])
+        for m in models:
+            tag = getattr(m, "model", None) or m.get("name", "")
+            size_bytes = getattr(m, "size", 0) or m.get("size", 0)
+            size_gb = round(size_bytes / (1024 ** 3), 2)
+            result["models"][tag] = size_gb
+        result["running"] = True
+    except Exception as e:
+        result["error"] = f"Ollama server unreachable at {OLLAMA_BASE_URL}: {e}"
+    return result
+
+
+def _ollama_has_model(tag: str) -> bool:
+    """Check if a specific Ollama model tag is pulled locally."""
+    info = _check_ollama_available()
+    if not info["running"]:
+        return False
+    # Ollama tags are case-insensitive; match with or without ':latest'
+    pulled = {m.lower() for m in info["models"].keys()}
+    return tag.lower() in pulled or f"{tag}:latest".lower() in pulled
+
+
+def _ollama_size_gb(tag: str) -> float:
+    info = _check_ollama_available()
+    return info["models"].get(tag, 0.0)
+
+
+def _pil_to_b64(img: "Image.Image", max_side: int = 1024) -> str:
+    """Convert a PIL image to a base64 PNG string for the Ollama API.
+
+    Ollama's `chat()` `images` field only accepts base64 strings (or bytes /
+    paths) — never PIL objects.  We also downscale large figures to keep
+    vision-token usage and VRAM reasonable when 6 figures are attached.
+    """
+    if max_side and max(img.size) > max_side:
+        img = img.copy()
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _ollama_content(response: Any) -> str:
+    """Return the assistant message text from an Ollama chat response.
+
+    Compatible with both dict-style (ollama ≤0.3) and pydantic-style
+    (ollama ≥0.4) client return values.
+    """
+    try:
+        return response["message"]["content"]
+    except (TypeError, KeyError):
+        try:
+            return response.message.content
+        except AttributeError:
+            return ""
+
+
+# ============================================================================
+# PERFORMANCE MONITORING DECORATOR
+# ============================================================================
+class PerformanceMonitor:
+    _timings: Dict[str, float] = {}
+    _call_counts: Dict[str, int] = {}
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._timings.clear()
+        cls._call_counts.clear()
+
+    @classmethod
+    def get_report(cls) -> str:
+        report = []
+        for func_name, total_time in sorted(
+            cls._timings.items(), key=lambda x: x[1], reverse=True
+        ):
+            count = cls._call_counts.get(func_name, 1)
+            avg_time = total_time / count
+            report.append(
+                f"  {func_name}: {total_time:.3f}s total "
+                f"({count} calls, {avg_time:.4f}s avg)"
+            )
+        return "\n".join(report)
+
+
+# ============================================================================
+# RUNTIME COMPUTATIONAL METRICS LOGGER
+# ============================================================================
+def get_memory_usage_mb() -> float:
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
+    except Exception:
+        return 0.0
+
+class RunMetricsLogger:
+    """Central logger for runtime computational metrics (steps + resources)."""
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.start_wall = time.time()
+        self.steps: List[Dict[str, Any]] = []
+        self.resources: List[Dict[str, Any]] = []
+        self.counters: Dict[str, Any] = {}
+        self._step_open: Optional[Dict[str, Any]] = None
+
+    def start_step(self, name: str) -> None:
+        self._sample_resources(tag=name, phase="start")
+        self._step_open = {
+            "name": name, "start": time.perf_counter(),
+            "mem_start": get_memory_usage_mb(),
+            "wall_start": time.time(),
+        }
+
+    def end_step(self, extra: Optional[Dict[str, Any]] = None) -> None:
+        if not self._step_open:
+            return
+        s = self._step_open
+        elapsed = time.perf_counter() - s["start"]
+        mem = get_memory_usage_mb()
+        entry = {
+            "name": s["name"],
+            "duration_s": elapsed,
+            "mem_start_mb": s["mem_start"],
+            "mem_end_mb": mem,
+            "mem_delta_mb": mem - s["mem_start"],
+            "wall_clock": datetime.now().strftime("%H:%M:%S"),
+            "elapsed_total_s": time.time() - self.start_wall,
+        }
+        if extra:
+            entry["extra"] = extra
+        self.steps.append(entry)
+        self._sample_resources(tag=s["name"], phase="end")
+        self._step_open = None
+
+    def _sample_resources(self, tag: str, phase: str = "") -> None:
+        self.resources.append({
+            "wall_clock": datetime.now().strftime("%H:%M:%S"),
+            "elapsed_s": time.time() - self.start_wall,
+            "rss_mb": get_memory_usage_mb(),
+            "threads": getattr(torch, "get_num_threads", lambda: 1)(),
+            "cuda": torch.cuda.is_available(),
+            "tag": f"{tag}:{phase}" if phase else tag,
+        })
+
+    def set(self, key: str, value: Any) -> None:
+        self.counters[key] = value
+
+    def add(self, key: str, value: int = 1) -> None:
+        self.counters[key] = self.counters.get(key, 0) + value
+
+    def step_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.steps)
+
+    def resource_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.resources)
+
+    def summary(self) -> Dict[str, Any]:
+        df = self.step_df()
+        total = float(df["duration_s"].sum()) if not df.empty else 0.0
+        peak = max((r["rss_mb"] for r in self.resources), default=get_memory_usage_mb())
+        return {
+            "run_id": self.run_id,
+            "total_duration_s": total,
+            "wall_clock_s": time.time() - self.start_wall,
+            "n_steps": len(self.steps),
+            "peak_memory_mb": peak,
+            "final_memory_mb": get_memory_usage_mb(),
+            "counters": dict(self.counters),
+            "function_timings": PerformanceMonitor.get_report(),
+        }
+
+    def save_log(self, folder: Optional[str] = None) -> str:
+        folder = folder or os.path.join(SCRIPT_DIR, "metrics_logs")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"run_metrics_{self.run_id}.json")
+        payload = {
+            "summary": self.summary(),
+            "steps": self.steps,
+            "resources": self.resources,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        return path
+
+def get_metrics_logger() -> RunMetricsLogger:
+    if "metrics_logger" not in st.session_state:
+        st.session_state.metrics_logger = RunMetricsLogger()
+    return st.session_state.metrics_logger
+
+def render_live_metrics_panel(metrics: RunMetricsLogger, container) -> None:
+    with container.container():
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Steps completed", len(metrics.steps))
+        c2.metric("Total time", f"{time.time() - metrics.start_wall:.1f}s")
+        c3.metric("Memory (RSS)", f"{get_memory_usage_mb():.0f} MB")
+        df = metrics.step_df()
+        if not df.empty:
+            last = df.iloc[-1]
+            c4.metric("Last step", last["name"],
+                      delta=f"{last['duration_s']:.2f}s", delta_color="off")
+        with st.expander("📋 Live step table", expanded=False):
+            if not df.empty:
+                st.dataframe(
+                    df[["name", "duration_s", "mem_start_mb",
+                        "mem_end_mb", "mem_delta_mb", "wall_clock"]],
+                    width="stretch",
+                )
+        rdf = metrics.resource_df()
+        if len(rdf) > 1:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=rdf["elapsed_s"], y=rdf["rss_mb"],
+                mode="lines+markers", name="RSS Memory",
+                text=rdf["tag"], hovertemplate=(
+                    "<b>%{text}</b><br>Elapsed: %{x:.1f}s<br>Memory: %{y:.0f} MB"
+                    "<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=220, margin=dict(l=10, r=10, t=30, b=10),
+                title="Memory timeline", xaxis_title="Elapsed (s)",
+                yaxis_title="MB",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+def render_metrics_dashboard(metrics: RunMetricsLogger) -> None:
+    if not metrics.steps:
+        st.info("No metrics recorded yet — run an analysis first.")
+        return
+    df = metrics.step_df()
+    rdf = metrics.resource_df()
+    total = df["duration_s"].sum()
+    peak = rdf["rss_mb"].max() if not rdf.empty else get_memory_usage_mb()
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total runtime", f"{total:.2f} s")
+    k2.metric("Wall clock", f"{time.time() - metrics.start_wall:.2f} s")
+    k3.metric("Peak memory", f"{peak:.1f} MB")
+    k4.metric("Steps executed", len(df))
+    k5.metric("Avg step time", f"{df['duration_s'].mean():.2f} s")
+
+    st.markdown("### ⏱️ Per-step duration")
+    step_fig = px.bar(
+        df.sort_values("duration_s", ascending=False),
+        x="duration_s", y="name", orientation="h",
+        color="duration_s", color_continuous_scale="Turbo",
+        text=df["duration_s"].map(lambda v: f"{v:.2f}s"),
+    )
+    step_fig.update_layout(height=max(300, 25 * len(df)), yaxis={'categoryorder': 'total ascending'})
+    st.plotly_chart(step_fig, width="stretch")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        pie = px.pie(df, names="name", values="duration_s", hole=0.45,
+                     title="Share of total runtime")
+        st.plotly_chart(pie, width="stretch")
+    with col_b:
+        mem_fig = go.Figure()
+        mem_fig.add_trace(go.Bar(x=df["name"], y=df["mem_start_mb"],
+                                 name="Mem start", marker_color="#3b82f6"))
+        mem_fig.add_trace(go.Bar(x=df["name"], y=df["mem_end_mb"],
+                                 name="Mem end", marker_color="#ef4444"))
+        mem_fig.update_layout(title="Memory before/after each step (MB)",
+                              barmode="group", xaxis_tickangle=-45)
+        st.plotly_chart(mem_fig, width="stretch")
+
+    if len(rdf) > 1:
+        st.markdown("### 💾 Resource timeline")
+        timeline = go.Figure()
+        timeline.add_trace(go.Scatter(
+            x=rdf["elapsed_s"], y=rdf["rss_mb"], mode="lines+markers",
+            name="RSS", text=rdf["tag"],
+            hovertemplate="<b>%{text}</b><br>%{x:.1f}s — %{y:.0f} MB<extra></extra>",
+        ))
+        timeline.update_layout(xaxis_title="Elapsed (s)", yaxis_title="MB", height=280)
+        st.plotly_chart(timeline, width="stretch")
+
+    st.markdown("### 🔢 Numeric step log")
+    st.dataframe(df, width="stretch")
+    with st.expander("Raw resource samples"):
+        st.dataframe(rdf, width="stretch")
+
+    st.markdown("### 🧮 Pipeline counters")
+    if metrics.counters:
+        counter_df = pd.DataFrame(
+            list(metrics.counters.items()), columns=["Counter", "Value"]
+        )
+        st.dataframe(counter_df, width="stretch")
+    else:
+        st.info("No counters recorded.")
+
+    with st.expander("⚙️ Function-level timings (PerformanceMonitor)"):
+        st.code(PerformanceMonitor.get_report() or "No timing data.", language="text")
+
+    st.markdown("### 📥 Save log")
+    if st.button("💾 Write metrics log to disk"):
+        path = metrics.save_log()
+        st.success(f"Log saved to `{path}`")
+    json_str = json.dumps(
+        {"summary": metrics.summary(), "steps": metrics.steps,
+         "resources": metrics.resources},
+        indent=2, default=str,
+    )
+    st.download_button("⬇️ Download metrics JSON", json_str.encode("utf-8"),
+                       file_name=f"run_metrics_{metrics.run_id}.json",
+                       mime="application/json")
+
+def timed(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        func_name = func.__qualname__
+        PerformanceMonitor._timings[func_name] = (
+            PerformanceMonitor._timings.get(func_name, 0) + elapsed
+        )
+        PerformanceMonitor._call_counts[func_name] = (
+            PerformanceMonitor._call_counts.get(func_name, 0) + 1
+        )
+        return result
+    return wrapper
+
+
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+st.set_page_config(
+    page_title="Dendrite Growth in Partitioned Electrolytes Concept Graph v6.3 + QDWA + Numerical Models",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================================
+# PATHS & DIRECTORIES
+# ============================================================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+JSON_METADATA_DIR = os.path.join(SCRIPT_DIR, "json_metadatabase")
+os.makedirs(JSON_METADATA_DIR, exist_ok=True)
+
+
+# ============================================================================
+# WIDGET SESSION-STATE DEFAULTS  (v6.2 FIX)
+# ----------------------------------------------------------------------------
+# Streamlit forbids writing to st.session_state[K] AFTER a widget with key=K has
+# been rendered during the same script run. The old code violated this rule in
+# several panels (notably `mt_cmap` and `qdwa_cmap`).
+#
+# The fix: seed every widget-backed key here, ONCE, BEFORE any widget is
+# created. `init_widget_defaults()` is called at the very top of `main()`.
+# ============================================================================
+_MT_WIDGET_DEFAULTS: Dict[str, Any] = {
+    # --- Microtransformer #2 chart customization ---
+    "mt_cmap": "viridis",
+    "mt_font_family": "Inter, Segoe UI, Roboto, sans-serif",
+    "mt_font_size": 11,
+    "mt_title_size": 15,
+    "mt_cbar_len": 0.8,
+    "mt_cbar_thick": 14,
+    "mt_cbar_title": "Weight",
+    "mt_show_grid": False,
+    "mt_seed": 42,
+
+    # --- Microtransformer #2 postprocessing panel ---
+    "mt_post_cmap": "viridis",
+    "mt_post_cmap_reverse": False,
+    "mt_post_font_size": 11,
+    "mt_post_title_size": 15,
+    "mt_post_sankey_pad": 15,
+    "mt_post_sankey_opacity": 0.4,
+    "mt_post_bar_text_pos": "outside",
+    "mt_post_bar_text_size": 12,
+
+    # --- QDWA customization ---
+    "qdwa_cmap": "viridis",
+    "qdwa_cmap_reverse": False,
+    "qdwa_post_font_size": 11,
+    "qdwa_post_title_size": 15,
+    "qdwa_post_font_family": "Inter, Segoe UI, Roboto, sans-serif",
+    "qdwa_post_sankey_pad": 20,
+    "qdwa_post_sankey_thick": 25,
+    "qdwa_post_sankey_opacity": 0.4,
+    "qdwa_post_bar_text_pos": "outside",
+    "qdwa_post_bar_text_size": 10,
+
+    # --- v6.3.5: Hybrid physics similarity α (categorical weight) ---
+    "qdwa_sim_alpha": 0.4,
+}
+
+
+def init_widget_defaults() -> None:
+    """Idempotently seed widget-backed keys in st.session_state.
+
+    MUST be called at the top of ``main()`` — before ``st.sidebar`` and before
+    any ``st.tabs()`` or widget inside them is instantiated. Writing to a
+    widget-backed key after its widget has rendered raises StreamlitAPIException.
+    """
+    for _k, _v in _MT_WIDGET_DEFAULTS.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+
+# ============================================================================
+# COLORMAP REGISTRY (50+)
+# ============================================================================
+SUPPORTED_COLORMAPS = {
+    "viridis": "Viridis", "plasma": "Plasma", "inferno": "Inferno", "magma": "Magma",
+    "cividis": "Cividis", "turbo": "Turbo", "jet": "Jet", "rainbow": "Rainbow",
+    "hsv": "Hsv", "nipy_spectral": "NipySpectral", "gist_rainbow": "GistRainbow",
+    "coolwarm": "Coolwarm", "RdBu": "RdBu", "seismic": "Seismic", "Spectral": "Spectral",
+    "tab10": "Set1", "tab20": "Set2", "tab20b": "Set3", "Accent": "Accent",
+    "Dark2": "Dark2", "Paired": "Paired", "Pastel1": "Pastel1", "Pastel2": "Pastel2",
+    "cubehelix": "Cubehelix", "bone": "Bone", "gray": "Gray", "pink": "Pink",
+    "spring": "Spring", "summer": "Summer", "autumn": "Autumn", "winter": "Winter",
+    "cool": "Cool", "hot": "Hot", "twilight": "Twilight", "copper": "Copper",
+    "YlOrRd": "YlOrRd", "OrRd": "OrRd", "PuRd": "PuRd", "RdPu": "RdPu",
+    "BuPu": "BuPu", "GnBu": "GnBu", "YlGnBu": "YlGnBu", "PuBuGn": "PuBuGn",
+    "BuGn": "BuGn", "YlGn": "YlGn", "Greys": "Greys", "afmhot": "Afmhot",
+    "gist_earth": "GistEarth", "terrain": "Terrain", "ocean": "Ocean",
+    "prism": "Prism", "flag": "Flag", "gnuplot": "Gnuplot", "gnuplot2": "Gnuplot2",
+    "brg": "BRG", "bwr": "BWR", "cmrmap": "CMRmap",
+    "gist_gray": "GistGray", "gist_heat": "GistHeat", "gist_stern": "GistStern",
+    "gist_yarg": "GistYarg", "binary": "Binary"
+}
+
+
+def get_colormap_colors(cmap_name: str, n: int) -> List[str]:
+    try:
+        cmap = matplotlib.colormaps.get_cmap(cmap_name).resampled(n)
+        return [matplotlib.colors.to_hex(cmap(i)) for i in range(n)]
+    except Exception:
+        try:
+            cmap = cm.get_cmap(cmap_name, n)
+            return [matplotlib.colors.to_hex(cmap(i)) for i in range(n)]
+        except Exception:
+            try:
+                cmap = matplotlib.colormaps.get_cmap("viridis").resampled(n)
+            except Exception:
+                cmap = cm.get_cmap("viridis", n)
+            return [matplotlib.colors.to_hex(cmap(i)) for i in range(n)]
+
+
+# ============================================================================
+# MICROTRANSFORMER CHART STYLING HELPERS
+# ============================================================================
+def plotly_continuous_scale(cmap_key: str, n: int = 12) -> List[str]:
+    """Return a list of n hex colors from a matplotlib colormap."""
+    return get_colormap_colors(cmap_key, n)
+
+def apply_mt_chart_style(fig, theme: Dict, is_axial: bool = True):
+    """Unify font/background/colorbar for microtransformer charts."""
+    fam = st.session_state.get("mt_font_family", "Inter, Segoe UI, Roboto, sans-serif")
+    tsize = int(st.session_state.get("mt_font_size", 11))
+    fig.update_layout(
+        font=dict(family=fam, size=tsize, color=theme["font"]),
+        title_font=dict(family=fam, size=int(st.session_state.get("mt_title_size", 15))),
+        paper_bgcolor=theme["plotly_paper"], plot_bgcolor=theme["plotly_bg"],
+    )
+    if is_axial:
+        try:
+            for ax in (fig.update_xaxes, fig.update_yaxes):
+                ax(
+                    showgrid=st.session_state.get("mt_show_grid", False),
+                    gridcolor=theme["grid_color"],
+                    tickfont=dict(family=fam, size=tsize, color=theme["axis_color"]),
+                    title_font=dict(family=fam, size=tsize + 1),
+                )
+        except Exception:
+            pass
+    try:
+        fig.update_layout(
+            coloraxis=dict(
+                colorbar=dict(
+                    title=dict(text=st.session_state.get("mt_cbar_title", "Weight"),
+                               font=dict(family=fam, size=tsize + 1, color=theme["font"])),
+                    tickfont=dict(family=fam, size=max(8, tsize - 1), color=theme["axis_color"]),
+                    thickness=st.session_state.get("mt_cbar_thick", 14),
+                    outlinewidth=0,
+                    len=st.session_state.get("mt_cbar_len", 0.8),
+                )
+            )
+        )
+    except Exception:
+        pass
+    return fig
+
+def robust_load_file(filepath: Path):
+    suffix = filepath.suffix.lower()
+    if suffix == '.bib':
+        return parse_bibtex_file(filepath)
+
+    text = filepath.read_text(encoding="utf-8-sig")
+    if not text.strip():
+        raise ValueError(f"File is empty (0 bytes or only whitespace).")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    sanitized = re.sub(r'NaN', 'null', text)
+    sanitized = re.sub(r'Infinity', 'null', sanitized)
+    sanitized = re.sub(r'-Infinity', 'null', sanitized)
+    sanitized = re.sub(r',(\s*[}\]])', r'\1', sanitized)
+    try:
+        return json.loads(sanitized)
+    except json.JSONDecodeError:
+        pass
+
+    records = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    if records:
+        return records
+
+    try:
+        df = pd.read_csv(filepath)
+        return df.to_dict(orient="records")
+    except Exception:
+        pass
+
+    preview = text[:300]
+    raise ValueError(
+        f"Could not parse {filepath.name}. First 200 chars: {preview[:200]}..."
+    )
+
+
+def parse_bibtex_file(filepath: Path) -> List[Dict]:
+    try:
+        import bibtexparser
+        from bibtexparser.bparser import BibTexParser
+        from bibtexparser.customization import convert_to_unicode
+        with open(filepath, 'r', encoding='utf-8') as bibfile:
+            parser = BibTexParser()
+            parser.customization = convert_to_unicode
+            bib_database = bibtexparser.load(bibfile, parser=parser)
+            records = []
+            for entry in bib_database.entries:
+                record = {
+                    'title': entry.get('title', ''),
+                    'abstract': entry.get('abstract', ''),
+                    'author': entry.get('author', ''),
+                    'year': entry.get('year', ''),
+                    'journal': entry.get('journal', entry.get('booktitle', '')),
+                    'doi': entry.get('doi', ''),
+                    'keywords': entry.get('keywords', ''),
+                    'entry_type': entry.get('ENTRYTYPE', ''),
+                    'id': entry.get('ID', ''),
+                    '_source_file': filepath.name,
+                }
+                records.append(record)
+            return records
+    except ImportError:
+        st.warning(
+            "bibtexparser not installed. Install with: pip install bibtexparser"
+        )
+        return []
+    except Exception as e:
+        st.error(f"BibTeX parse error for {filepath.name}: {e}")
+        return []
+
+
+@st.cache_data(show_spinner=False)
+def load_all_json_files(directory):
+    files = (
+        sorted(Path(directory).glob("*.json"))
+        + sorted(Path(directory).glob("*.bib"))
+        + sorted(Path(directory).glob("*.csv"))
+    )
+    if not files:
+        return []
+    loaded = []
+    for fp in files:
+        try:
+            data = robust_load_file(fp)
+            if isinstance(data, list):
+                loaded.append((str(fp.name), data))
+            elif isinstance(data, dict):
+                loaded.append((str(fp.name), [data]))
+            else:
+                loaded.append((str(fp.name), []))
+        except Exception as e:
+            st.error(f"Error loading `{fp.name}`: {e}")
+            try:
+                raw_bytes = fp.read_bytes()[:300]
+                hex_str = raw_bytes.hex()
+                formatted = ' '.join(
+                    hex_str[i:i + 2] for i in range(0, len(hex_str), 2)
+                )
+                st.code(
+                    f"Hex preview (first {len(raw_bytes)} bytes):\n{formatted}",
+                    language="text",
+                )
+            except Exception:
+                pass
+    return loaded
+
+
+@st.cache_data(show_spinner=False)
+def build_master_dataframe(file_records):
+    rows = []
+    for fname, records in file_records:
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            rec = dict(rec)
+            rec["_source_file"] = fname
+            rows.append(rec)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.json_normalize(rows)
+    df = df.replace({
+        float("nan"): pd.NA, None: pd.NA, "NaN": pd.NA, "": pd.NA
+    })
+    year_cols = [c for c in df.columns if 'year' in c.lower()]
+    if year_cols:
+        df["Year"] = pd.to_numeric(df[year_cols[0]], errors="coerce")
+    elif "Year" in df.columns:
+        df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    return df
+
+
+# ============================================================================
+# ENHANCED ONTOLOGY & NLP REASONING SYSTEM (DENDRITE GROWTH DOMAIN)
+# ============================================================================
+class ConceptType(Enum):
+    MATERIAL = "material"
+    PROCESS = "process"
+    PROPERTY = "property"
+    PHENOMENON = "phenomenon"
+    METHOD = "method"
+    PARAMETER = "parameter"
+    MICROSTRUCTURE = "microstructure"
+    MODEL = "model"
+    GENERAL = "general"
+
+
+class RelationshipType(Enum):
+    SYNONYM = "synonym"
+    HYPERNYM = "hypernym"
+    HYPONYM = "hyponym"
+    CAUSES = "causes"
+    RESULTS_IN = "results_in"
+    INFLUENCES = "influences"
+    DEPENDS_ON = "depends_on"
+    PART_OF = "part_of"
+    HAS_PART = "has_part"
+    CO_OCCURS = "co_occurs"
+    SEMANTIC = "semantic"
+    INFERRED = "inferred"
+    BRIDGE = "bridge"
+    CONSTRAINS = "constrains"
+    MODIFIES = "modifies"
+    DETERMINES = "determines"
+    SUPPRESSES = "suppresses"
+    CORRECTS = "corrects"
+    SELECTS = "selects"
+    INITIATES = "initiates"
+    DRIVES = "drives"
+    TRANSITIONS_TO = "transitions_to"
+    REPLACES = "replaces"
+    TRAINS = "trains"
+    OUTPUTS = "outputs"
+    LEARNS = "learns"
+    CAPTURES = "captures"
+    PARALLELIZES = "parallelizes"
+    POSITIONS = "positions"
+    IDENTIFIES = "identifies"
+    FORMS = "forms"
+    PROCESSES = "processes"
+    STABILIZES = "stabilizes"
+    PRESERVES = "preserves"
+    GENERATES = "generates"
+    COMPOSES = "composes"
+    QUALIFIES = "qualifies"
+    ENABLES = "enables"
+    DISCOVERS = "disovers"
+    PRE_TRAINS = "pre_trains"
+    GENERALIZES = "generalizes"
+    QUERIES = "queries"
+    OPTIMIZES = "optimizes"
+    VALIDATES = "validates"
+    BOUNDS = "bounds"
+    QUANTIFIES = "quantifies"
+    EVALUATES = "evaluates"
+    COMPARES = "compares"
+    COMPUTES = "computes"
+    MODELS = "models"
+    AVERAGES = "averages"
+    MAPS = "maps"
+    SIMULATES = "simulates"
+    DETECTS = "detects"
+    INTEGRATES = "integrates"
+    COUPLES = "couples"
+    UPSCALES = "upscales"
+    RESOLVES = "resolves"
+    SYNCHRONIZES = "synchronizes"
+    CHARACTERIZES = "characterizes"
+    DECOMPOSES = "decomposes"
+    DESIGNS = "designs"
+    APPROXIMATES = "approximates"
+    STRENGTHENS = "strengthens"
+    EXPLAINS = "explains"
+    INTERPRETS = "interprets"
+    GROUPS = "groups"
+    VISUALIZES = "visualizes"
+    CONSTRUCTS = "constructs"
+    FRAMES = "frames"
+    ACCELERATES = "accelerates"
+    ENFORCES = "enforces"
+    CORRELATES = "correlates"
+
+
+# ============================================================================
+# RELATIONSHIP MAPPING FOR MICROTRANSFORMER
+# ============================================================================
+RELATIONSHIP_TO_IDX = {rel.name: i for i, rel in enumerate(RelationshipType)}
+NUM_EDGE_TYPES = len(RelationshipType)
+
+# 32 Specialized Latent Experts for Dendrite Growth in Partitioned Electrolytes
+DENDRITE_EXPERT_LABELS = [
+    "Phase Field Method", "Order Parameter Eta", "Order Parameter Phi",
+    "Chemical Free Energy", "Mechanical Free Energy", "Gradient Energy Coefficient",
+    "Solid-Liquid Interface", "Dendrite Length Metric", "Dendrite Area Metric",
+    "Young's Modulus Interpolation", "Poisson's Ratio", "Eigenstrain",
+    "Von Mises Stress", "Elastic Strain Energy", "Butler-Volmer Kinetics",
+    "Overpotential", "Ionic Concentration", "Solid-Liquid Ratio (S/L)",
+    "Horizontal Layering Geometry", "Vertical Stripe Geometry", "Random Inclusion Geometry",
+    "Nucleation Perturbation", "LLZO Solid Electrolyte", "LiPF6 Liquid Electrolyte",
+    "Lithium Metal Anode", "Mechanical Suppression", "Geometric Confinement",
+    "Multiphysics Coupling", "Finite Element Analysis", "Thermodynamic Equilibrium",
+    "Dead Lithium Formation", "Cycle Life Degradation"
+]
+
+# ============================================================================
+# v6.3 — HARDCODED NUMERICAL MODELS PHYSICS DATABASE (Models A–F)
+# ----------------------------------------------------------------------------
+# Canonical physics for the six numerical models from the manuscript, layered
+# on top of the existing JSON ground-truth (abstracts, BibTeX, CSV) in
+# `json_metadatabase/`.  These values are the *certain* knowledge baked into
+# the app; the user can attach an additional `model_physics_overrides.json`
+# via the sidebar uploader to extend or override any of these at runtime.
+#
+# Layout: 3 geometries × 2 S/L ratios = 6 models.
+#   * Horizontal layering  (Models A, D)
+#   * Vertical stripes     (Models B, E)
+#   * Random inclusions    (Models C, F)
+# S/L ratios: 4:1 (high-solid, Models A–C) and 1:1 (balanced, Models D–F).
+#
+# All values are in SI-friendly units; Joule densities are J/m^3, stress in
+# MPa, length in micrometres, current density in mA/cm^2, concentration in
+# mol/L, overpotential in mV.
+# ============================================================================
+NUMERICAL_MODEL_NAMES: List[str] = ["Model A", "Model B", "Model C", "Model D", "Model E", "Model F"]
+
+# ============================================================================
+# v6.3.1 — GLOBAL MATERIAL PROPERTIES & SIMULATION PARAMETERS
+# ----------------------------------------------------------------------------
+# Extracted verbatim from manuscript Table (params_enhanced) and Table
+# (ranges_enhanced). These values are SHARED across all 6 models; each model's
+# per-model dict below references them for convenience, but the authoritative
+# source is this dict.
+#
+# References (from manuscript main.txt):
+#   He2021-ACSAMI       → Li metal Young's modulus
+#   2011Mechanical       → LiPF6 liquid electrolyte Young's modulus
+#   Fu2020-ACSAMI        → LLZO Young's modulus & Poisson's ratio
+#   Masias2018-JMSC      → Li metal Poisson's ratio
+#   shen2024dead         → Mobility coefficients M_e, M_s
+#   2025Study            → Mobility coefficient M_φ
+#   ren2020inhibit       → σ_e, σ_φ conductivities
+#   arguello2022dendrite → σ_s conductivity
+#   zhang2022dead        → c_s_eq, c_0_eq concentrations
+# ============================================================================
+GLOBAL_MATERIAL_PROPERTIES: Dict[str, Any] = {
+    # --- Young's moduli (GPa) ---
+    "youngs_modulus_electrode_gpa": 4.9,        # Li metal (He2021-ACSAMI)
+    "youngs_modulus_solid_gpa": 155.0,          # LLZO solid electrolyte (Fu2020-ACSAMI)
+    "youngs_modulus_liquid_gpa": 0.877,         # LiPF6 liquid electrolyte (2011Mechanical)
+    # --- Poisson's ratios (dimensionless) ---
+    "poissons_ratio_electrode": 0.381,          # Li metal (Masias2018-JMSC)
+    "poissons_ratio_solid": 0.25,               # LLZO (Fu2020-ACSAMI)
+    "poissons_ratio_liquid": 0.499,             # LiPF6 (near incompressible limit 0.5)
+    # --- Eigenstrain eigenvalues (dimensionless, from ren2020inhibit) ---
+    "eigenstrain_v1": -0.866e-3,                # First eigenvalue of strain tensor
+    "eigenstrain_v2": -0.773e-3,                # Second eigenvalue
+    "eigenstrain_v3": -0.529e-3,                # Third eigenvalue
+    # --- Conductivities (S/m) ---
+    "conductivity_electrode_s_m": 1.0e6,        # σ_e (ren2020inhibit)
+    "conductivity_liquid_s_m": 1.19,            # σ_s (arguello2022dendrite)
+    "conductivity_solid_s_m": 1.0,              # σ_φ (ren2020inhibit)
+    # --- Mobility coefficients (mol m² J⁻¹ s⁻¹) ---
+    "mobility_electrode": 1.0e-13,              # M_e (shen2024dead)
+    "mobility_liquid": 5.0e-13,                 # M_s (shen2024dead)
+    "mobility_solid": 3.0e-13,                  # M_φ (2025Study)
+    # --- Concentrations (mol m⁻³) ---
+    "li_metal_concentration_mol_m3": 7.69e4,    # c_s_eq (zhang2022dead)
+    "li_ion_bulk_concentration_mol_m3": 1.0e3,  # c_0 = 1000 mol/m³ (zhang2022dead)
+    # --- Phase-field barrier heights (J m⁻³) ---
+    "barrier_height_eta": 2.0e3,                # W_η
+    "barrier_height_phi": 2.0e3,                # W_φ
+}
+
+GLOBAL_SIMULATION_PARAMETERS: Dict[str, Any] = {
+    # --- Domain geometry ---
+    "domain_size_x_um": 75.0,                   # 75 μm (x-direction, primary growth)
+    "domain_size_y_um": 50.0,                   # 50 μm (y-direction)
+    "grid_spacing_um": 1.0,                     # Δx = Δy = 1 μm
+    "grid_points_x": 75,
+    "grid_points_y": 50,
+    # --- Electrode region ---
+    "electrode_width_pct": 0.06,                # ~6% of domain width (left side)
+    # --- Time stepping ---
+    "time_step_s": 1.0e-6,                      # Δt = 10⁻⁶ s
+    # --- Applied voltage (V) — four test conditions ---
+    "applied_voltage_U1_v": -0.45,              # Reference condition
+    "applied_voltage_U2_v": -0.40,              # Reduced magnitude
+    "applied_voltage_U3_v": -0.50,              # Increased magnitude
+    "applied_voltage_U4_v": -0.30,              # Lowest magnitude (smoothest growth)
+    "applied_voltage_range_v": (-0.50, -0.30),  # U ranges from -0.5 to -0.3 V
+    # --- Kinetic / interfacial parameters (from Table ranges_enhanced) ---
+    "interface_mobility_eta": 0.25,             # L_e (m³ J⁻¹ s⁻¹)
+    "reaction_rate_constant": 0.1,              # L_s (s⁻¹)
+    "interface_mobility_phi": 1.0e-4,           # L_φ (m³ J⁻¹ s⁻¹) — keeps φ static
+    "gradient_energy_eta_electrode": 1.0e-11,   # κ_η for electrode (J m⁻¹)
+    "gradient_energy_eta_electrolyte": 1.0e-9,  # κ_η for electrolyte (J m⁻¹)
+    "gradient_energy_phi": 1.0e-11,             # κ_φ (J m⁻¹)
+    # --- Chemical free energy curvature (from Table ranges_enhanced) ---
+    "chem_curvature_electrode": 292.0,          # A_e/V_m (J mol⁻¹)
+    "chem_curvature_electrolyte": 73.0,         # A_s/V_m (J mol⁻¹)
+    "chem_eq_conc_electrode": 0.4,              # c_eq_e (dimensionless)
+    "chem_eq_conc_electrolyte": 0.6,            # c_eq_s (dimensionless)
+    # --- Noise / perturbation ---
+    "noise_strength": 1.0e-3,                   # ψ (s⁻¹)
+    "nucleation_perturbation_amplitude": 0.001, # ±0.001 at electrode-electrolyte interface
+    # --- Physical constants ---
+    "faraday_constant": 96485.0,                # F (C mol⁻¹)
+    "gas_constant": 8.314,                      # R (J mol⁻¹ K⁻¹)
+    "temperature": 300.0,                       # T = 300 K
+    "charge_transfer_coefficient": 0.5,         # α (assumed symmetric)
+    "valency_li": 1,                            # z = 1
+}
+
+# ============================================================================
+# v6.3.1 — PER-MODEL PHYSICS (verified against manuscript main.txt)
+# ----------------------------------------------------------------------------
+# S/L ratios from the FINALIZED figure caption of Fig.1 (fig1-fin.png):
+#   "Model A with solid-electrolyte boundary layer, S/L = 4:1;
+#    Model B with alternating electrolyte layers, S/L = 2:3;
+#    Model C having central solid-electrolyte layer, S/L = 4:1;
+#    Model D with solid-electrolyte boundary layer and S/L = 3:2;
+#    Model E having alternating electrolyte layers, S/L = 1:4;
+#    Model F with central solid-electrolyte layer, S/L = 2:3."
+#
+# Dendrite length % from manuscript Results section:
+#   Model A: 88%, Model B: >90%, Model C: 97%, Model D: ~90%, Model E: >90%, Model F: 93%
+#
+# Time to max length from Fig.5(b) caption:
+#   A=710s, B=793s, C=1037s, D=750s, E=671s, F=2359s
+#
+# Area fraction from Fig.5(b) red curve (and text for Model A: 3.6%):
+#   A=3.6%, B=5.8%, C=2.9%, D=3.3%, E=8.8%, F=4.1%
+#
+# Von Mises stress range: 0–0.059 GPa (from text). Model A reaches the max
+# 0.059 GPa at the solid-state boundary near the electrode. Other models
+# estimated proportionally based on solid fraction and geometry.
+# ============================================================================
+NUMERICAL_MODELS_PHYSICS: Dict[str, Dict[str, Any]] = {
+    # === Model A: boundary layer, S/L = 4:1 (80% solid) ===
+    "Model A": {
+        "geometry": "boundary_layer",           # solid-electrolyte boundary layer
+        "s_l_ratio": 4.0,                       # 4:1
+        "solid_fraction": 0.80,                 # 4/(4+1) = 80%
+        "domain_size_x_um": 75.0,
+        "domain_size_y_um": 50.0,
+        "max_dendrite_length_pct": 0.88,        # 88% (from text)
+        "time_to_max_length_s": 710,            # t_j = 710 s (from Fig.5b caption)
+        "dendrite_area_pct": 0.036,             # 3.6% (from text)
+        "branch_count": 2,                      # side branches suppressed
+        "side_branch_suppressed": True,         # text: "growth of side branches... is suppressed"
+        "von_mises_stress_peak_gpa": 0.059,     # 0.059 GPa = 59 MPa (text: maximum at solid boundary)
+        # Global material properties (references GLOBAL_MATERIAL_PROPERTIES)
+        "youngs_modulus_electrode_gpa": 4.9,    # Li metal
+        "youngs_modulus_solid_gpa": 155.0,      # LLZO
+        "youngs_modulus_liquid_gpa": 0.877,     # LiPF6
+        "poissons_ratio_electrode": 0.381,
+        "poissons_ratio_solid": 0.25,
+        "poissons_ratio_liquid": 0.499,
+        "eigenstrain_v1": -0.866e-3,
+        "eigenstrain_v2": -0.773e-3,
+        "eigenstrain_v3": -0.529e-3,
+        # Electrochemical (reference condition U1)
+        "applied_voltage_v": -0.45,             # U1 reference
+        "overpotential_mv": 450.0,              # |Δζ - E_eq| ≈ 450 mV at U1
+        "ionic_concentration_mol_m3": 1000.0,   # c_0 = 1000 mol/m³
+        "conductivity_electrode_s_m": 1.0e6,
+        "conductivity_liquid_s_m": 1.19,
+        "conductivity_solid_s_m": 1.0,
+        # Phase field
+        "interface_mobility_eta": 0.25,         # L_e
+        "reaction_rate_constant": 0.1,          # L_s
+        "interface_mobility_phi": 1.0e-4,       # L_φ (keeps φ static)
+        "gradient_energy_eta": 1.0e-11,         # κ_η (electrode)
+        "gradient_energy_phi": 1.0e-11,         # κ_φ
+        "barrier_height_eta": 2.0e3,            # W_η
+        "barrier_height_phi": 2.0e3,            # W_φ
+        "noise_strength": 1.0e-3,               # ψ
+        "nucleation_perturbation_amplitude": 0.001,  # ±0.001
+        # Chemical free energy curvature
+        "chem_curvature_electrode": 292.0,      # A_e/V_m
+        "chem_curvature_electrolyte": 73.0,     # A_s/V_m
+        # Mobility
+        "mobility_electrode": 1.0e-13,          # M_e
+        "mobility_liquid": 5.0e-13,             # M_s
+        "mobility_solid": 3.0e-13,              # M_φ
+        # Order parameter targets
+        "order_parameter_eta_target": 1.0,      # η=1 in electrode
+        "order_parameter_phi_target": 1.0,      # φ=1 in solid partitions
+        "description": "Model A: solid-electrolyte boundary layer, S/L=4:1 (80% solid). Strong directional confinement; side-branch growth suppressed; dendrite reaches 88% of inter-electrode gap at t=710s. Peak von Mises stress 0.059 GPa at solid boundary near electrode. Area fraction 3.6%.",
+    },
+    # === Model B: alternating layers, S/L = 2:3 (40% solid) ===
+    "Model B": {
+        "geometry": "alternating_layers",       # alternating electrolyte layers
+        "s_l_ratio": 0.667,                     # 2:3 → 2/3 ≈ 0.667
+        "solid_fraction": 0.40,                 # 2/(2+3) = 40%
+        "domain_size_x_um": 75.0,
+        "domain_size_y_um": 50.0,
+        "max_dendrite_length_pct": 0.92,        # >90% (from text: "all exceeding 90%")
+        "time_to_max_length_s": 793,            # t_j = 793 s
+        "dendrite_area_pct": 0.058,             # 5.8% (from Fig.5b)
+        "branch_count": 4,                      # numerous side branches
+        "side_branch_suppressed": False,        # text: "numerous side branches"
+        "von_mises_stress_peak_gpa": 0.025,     # ~0.025 GPa estimated (40% solid)
+        "youngs_modulus_electrode_gpa": 4.9,
+        "youngs_modulus_solid_gpa": 155.0,
+        "youngs_modulus_liquid_gpa": 0.877,
+        "poissons_ratio_electrode": 0.381,
+        "poissons_ratio_solid": 0.25,
+        "poissons_ratio_liquid": 0.499,
+        "eigenstrain_v1": -0.866e-3,
+        "eigenstrain_v2": -0.773e-3,
+        "eigenstrain_v3": -0.529e-3,
+        "applied_voltage_v": -0.45,
+        "overpotential_mv": 450.0,
+        "ionic_concentration_mol_m3": 1000.0,
+        "conductivity_electrode_s_m": 1.0e6,
+        "conductivity_liquid_s_m": 1.19,
+        "conductivity_solid_s_m": 1.0,
+        "interface_mobility_eta": 0.25,
+        "reaction_rate_constant": 0.1,
+        "interface_mobility_phi": 1.0e-4,
+        "gradient_energy_eta": 1.0e-11,
+        "gradient_energy_phi": 1.0e-11,
+        "barrier_height_eta": 2.0e3,
+        "barrier_height_phi": 2.0e3,
+        "noise_strength": 1.0e-3,
+        "nucleation_perturbation_amplitude": 0.001,
+        "chem_curvature_electrode": 292.0,
+        "chem_curvature_electrolyte": 73.0,
+        "mobility_electrode": 1.0e-13,
+        "mobility_liquid": 5.0e-13,
+        "mobility_solid": 3.0e-13,
+        "order_parameter_eta_target": 1.0,
+        "order_parameter_phi_target": 1.0,
+        "description": "Model B: alternating electrolyte layers, S/L=2:3 (40% solid). Lower solid fraction; numerous side branches and large extended area; max dendrite length >90% at t=793s. Area fraction 5.8%.",
+    },
+    # === Model C: central layer, S/L = 4:1 (80% solid) ===
+    "Model C": {
+        "geometry": "central_layer",            # central solid-electrolyte layer
+        "s_l_ratio": 4.0,                       # 4:1 (same as Model A, different geometry)
+        "solid_fraction": 0.80,                 # 80%
+        "domain_size_x_um": 75.0,
+        "domain_size_y_um": 50.0,
+        "max_dendrite_length_pct": 0.97,        # 97% (from text: highest of all models)
+        "time_to_max_length_s": 1037,           # t_j = 1037 s (longest time to max)
+        "dendrite_area_pct": 0.029,             # 2.9% (from Fig.5b — lowest area fraction)
+        "branch_count": 1,                      # needle-like main branch, few side branches
+        "side_branch_suppressed": True,         # text: "needle-like main branch with few side branches"
+        "von_mises_stress_peak_gpa": 0.050,     # ~0.050 GPa estimated (80% solid, central layer)
+        "youngs_modulus_electrode_gpa": 4.9,
+        "youngs_modulus_solid_gpa": 155.0,
+        "youngs_modulus_liquid_gpa": 0.877,
+        "poissons_ratio_electrode": 0.381,
+        "poissons_ratio_solid": 0.25,
+        "poissons_ratio_liquid": 0.499,
+        "eigenstrain_v1": -0.866e-3,
+        "eigenstrain_v2": -0.773e-3,
+        "eigenstrain_v3": -0.529e-3,
+        "applied_voltage_v": -0.45,
+        "overpotential_mv": 450.0,
+        "ionic_concentration_mol_m3": 1000.0,
+        "conductivity_electrode_s_m": 1.0e6,
+        "conductivity_liquid_s_m": 1.19,
+        "conductivity_solid_s_m": 1.0,
+        "interface_mobility_eta": 0.25,
+        "reaction_rate_constant": 0.1,
+        "interface_mobility_phi": 1.0e-4,
+        "gradient_energy_eta": 1.0e-11,
+        "gradient_energy_phi": 1.0e-11,
+        "barrier_height_eta": 2.0e3,
+        "barrier_height_phi": 2.0e3,
+        "noise_strength": 1.0e-3,
+        "nucleation_perturbation_amplitude": 0.001,
+        "chem_curvature_electrode": 292.0,
+        "chem_curvature_electrolyte": 73.0,
+        "mobility_electrode": 1.0e-13,
+        "mobility_liquid": 5.0e-13,
+        "mobility_solid": 3.0e-13,
+        "order_parameter_eta_target": 1.0,
+        "order_parameter_phi_target": 1.0,
+        "description": "Model C: central solid-electrolyte layer, S/L=4:1 (80% solid). Same S/L as Model A but different geometry. Needle-like dendrite with few side branches; longest max dendrite length (97%) but lowest area fraction (2.9%) at t=1037s.",
+    },
+    # === Model D: boundary layer, S/L = 3:2 (60% solid) ===
+    "Model D": {
+        "geometry": "boundary_layer",           # solid-electrolyte boundary layer (same as A)
+        "s_l_ratio": 1.5,                       # 3:2 → 3/2 = 1.5
+        "solid_fraction": 0.60,                 # 3/(3+2) = 60%
+        "domain_size_x_um": 75.0,
+        "domain_size_y_um": 50.0,
+        "max_dendrite_length_pct": 0.90,        # ~90% (from Fig.5b, estimated)
+        "time_to_max_length_s": 750,            # t_j = 750 s
+        "dendrite_area_pct": 0.033,             # 3.3% (from Fig.5b)
+        "branch_count": 5,                      # more side branches than A
+        "side_branch_suppressed": False,        # text: "more side branches and greater lengths"
+        "von_mises_stress_peak_gpa": 0.035,     # ~0.035 GPa estimated (60% solid)
+        "youngs_modulus_electrode_gpa": 4.9,
+        "youngs_modulus_solid_gpa": 155.0,
+        "youngs_modulus_liquid_gpa": 0.877,
+        "poissons_ratio_electrode": 0.381,
+        "poissons_ratio_solid": 0.25,
+        "poissons_ratio_liquid": 0.499,
+        "eigenstrain_v1": -0.866e-3,
+        "eigenstrain_v2": -0.773e-3,
+        "eigenstrain_v3": -0.529e-3,
+        "applied_voltage_v": -0.45,
+        "overpotential_mv": 450.0,
+        "ionic_concentration_mol_m3": 1000.0,
+        "conductivity_electrode_s_m": 1.0e6,
+        "conductivity_liquid_s_m": 1.19,
+        "conductivity_solid_s_m": 1.0,
+        "interface_mobility_eta": 0.25,
+        "reaction_rate_constant": 0.1,
+        "interface_mobility_phi": 1.0e-4,
+        "gradient_energy_eta": 1.0e-11,
+        "gradient_energy_phi": 1.0e-11,
+        "barrier_height_eta": 2.0e3,
+        "barrier_height_phi": 2.0e3,
+        "noise_strength": 1.0e-3,
+        "nucleation_perturbation_amplitude": 0.001,
+        "chem_curvature_electrode": 292.0,
+        "chem_curvature_electrolyte": 73.0,
+        "mobility_electrode": 1.0e-13,
+        "mobility_liquid": 5.0e-13,
+        "mobility_solid": 3.0e-13,
+        "order_parameter_eta_target": 1.0,
+        "order_parameter_phi_target": 1.0,
+        "description": "Model D: solid-electrolyte boundary layer, S/L=3:2 (60% solid). Similar pattern to Model A but with thicker liquid region. Insufficient solid (60%) to fully restrict vertical growth; more side branches. Max length ~90% at t=750s. Area fraction 3.3%.",
+    },
+    # === Model E: alternating layers, S/L = 1:4 (20% solid) ===
+    "Model E": {
+        "geometry": "alternating_layers",       # alternating electrolyte layers (same as B)
+        "s_l_ratio": 0.25,                      # 1:4 → 1/4 = 0.25
+        "solid_fraction": 0.20,                 # 1/(1+4) = 20%
+        "domain_size_x_um": 75.0,
+        "domain_size_y_um": 50.0,
+        "max_dendrite_length_pct": 0.92,        # >90% (from text: "all exceeding 90%")
+        "time_to_max_length_s": 671,            # t_j = 671 s
+        "dendrite_area_pct": 0.088,             # 8.8% (from Fig.5b — HIGHEST area fraction)
+        "branch_count": 6,                      # significantly stronger branches
+        "side_branch_suppressed": False,        # text: "significantly stronger branches"
+        "von_mises_stress_peak_gpa": 0.015,     # ~0.015 GPa estimated (20% solid — lowest)
+        "youngs_modulus_electrode_gpa": 4.9,
+        "youngs_modulus_solid_gpa": 155.0,
+        "youngs_modulus_liquid_gpa": 0.877,
+        "poissons_ratio_electrode": 0.381,
+        "poissons_ratio_solid": 0.25,
+        "poissons_ratio_liquid": 0.499,
+        "eigenstrain_v1": -0.866e-3,
+        "eigenstrain_v2": -0.773e-3,
+        "eigenstrain_v3": -0.529e-3,
+        "applied_voltage_v": -0.45,
+        "overpotential_mv": 450.0,
+        "ionic_concentration_mol_m3": 1000.0,
+        "conductivity_electrode_s_m": 1.0e6,
+        "conductivity_liquid_s_m": 1.19,
+        "conductivity_solid_s_m": 1.0,
+        "interface_mobility_eta": 0.25,
+        "reaction_rate_constant": 0.1,
+        "interface_mobility_phi": 1.0e-4,
+        "gradient_energy_eta": 1.0e-11,
+        "gradient_energy_phi": 1.0e-11,
+        "barrier_height_eta": 2.0e3,
+        "barrier_height_phi": 2.0e3,
+        "noise_strength": 1.0e-3,
+        "nucleation_perturbation_amplitude": 0.001,
+        "chem_curvature_electrode": 292.0,
+        "chem_curvature_electrolyte": 73.0,
+        "mobility_electrode": 1.0e-13,
+        "mobility_liquid": 5.0e-13,
+        "mobility_solid": 3.0e-13,
+        "order_parameter_eta_target": 1.0,
+        "order_parameter_phi_target": 1.0,
+        "description": "Model E: alternating electrolyte layers, S/L=1:4 (20% solid). Smallest solid electrolyte proportion (20%); significantly stronger branches; highest area fraction (8.8%); max length >90% at t=671s.",
+    },
+    # === Model F: central layer, S/L = 2:3 (40% solid) ===
+    "Model F": {
+        "geometry": "central_layer",            # central solid-electrolyte layer (same as C)
+        "s_l_ratio": 0.667,                     # 2:3 → 2/3 ≈ 0.667
+        "solid_fraction": 0.40,                 # 2/(2+3) = 40%
+        "domain_size_x_um": 75.0,
+        "domain_size_y_um": 50.0,
+        "max_dendrite_length_pct": 0.93,        # 93% (from text: "accounting for 93% of the total")
+        "time_to_max_length_s": 2359,           # t_j = 2359 s (LONGEST of all models)
+        "dendrite_area_pct": 0.041,             # 4.1% (from Fig.5b)
+        "branch_count": 2,                      # similar to C but less suppressed
+        "side_branch_suppressed": True,         # similar geometry to C, partial suppression
+        "von_mises_stress_peak_gpa": 0.030,     # ~0.030 GPa estimated (40% solid, central layer)
+        "youngs_modulus_electrode_gpa": 4.9,
+        "youngs_modulus_solid_gpa": 155.0,
+        "youngs_modulus_liquid_gpa": 0.877,
+        "poissons_ratio_electrode": 0.381,
+        "poissons_ratio_solid": 0.25,
+        "poissons_ratio_liquid": 0.499,
+        "eigenstrain_v1": -0.866e-3,
+        "eigenstrain_v2": -0.773e-3,
+        "eigenstrain_v3": -0.529e-3,
+        "applied_voltage_v": -0.45,
+        "overpotential_mv": 450.0,
+        "ionic_concentration_mol_m3": 1000.0,
+        "conductivity_electrode_s_m": 1.0e6,
+        "conductivity_liquid_s_m": 1.19,
+        "conductivity_solid_s_m": 1.0,
+        "interface_mobility_eta": 0.25,
+        "reaction_rate_constant": 0.1,
+        "interface_mobility_phi": 1.0e-4,
+        "gradient_energy_eta": 1.0e-11,
+        "gradient_energy_phi": 1.0e-11,
+        "barrier_height_eta": 2.0e3,
+        "barrier_height_phi": 2.0e3,
+        "noise_strength": 1.0e-3,
+        "nucleation_perturbation_amplitude": 0.001,
+        "chem_curvature_electrode": 292.0,
+        "chem_curvature_electrolyte": 73.0,
+        "mobility_electrode": 1.0e-13,
+        "mobility_liquid": 5.0e-13,
+        "mobility_solid": 3.0e-13,
+        "order_parameter_eta_target": 1.0,
+        "order_parameter_phi_target": 1.0,
+        "description": "Model F: central solid-electrolyte layer, S/L=2:3 (40% solid). Similar structure to Model C but with thinner central solid layer and lower solid fraction. Max dendrite length 93% at t=2359s (longest time). Area fraction 4.1%.",
+    },
+}
+
+# Canonical model-name → ontology concept key mapping (used by the ontology
+# builder and the abstract-association pipeline).
+MODEL_TO_CONCEPT_KEY: Dict[str, str] = {
+    "Model A": "model_a",
+    "Model B": "model_b",
+    "Model C": "model_c",
+    "Model D": "model_d",
+    "Model E": "model_e",
+    "Model F": "model_f",
+}
+
+# Geometry type → ontology concept key (v6.3.1 — updated to match manuscript
+# figure caption terminology).
+GEOMETRY_TO_CONCEPT_KEY: Dict[str, str] = {
+    "boundary_layer": "boundary_layer",
+    "alternating_layers": "alternating_layers",
+    "central_layer": "central_layer",
+}
+
+# Physics field → ontology concept it constrains/determines (used to wire
+# causal edges from each Model node into the existing ontology graph).
+# v6.3.1: Updated to match the corrected field names from the manuscript.
+PHYSICS_FIELD_TO_CONCEPT: Dict[str, str] = {
+    "s_l_ratio": "solid_liquid_ratio",
+    "solid_fraction": "solid_liquid_ratio",
+    "geometry": "spatial_configuration",
+    "domain_size_x_um": "domain_size",
+    "domain_size_y_um": "domain_size",
+    "max_dendrite_length_pct": "dendrite_length",
+    "time_to_max_length_s": "dendrite_length",
+    "dendrite_area_pct": "dendrite_area",
+    "side_branch_suppressed": "mechanical_suppression",
+    "branch_count": "dendrite_growth",
+    "von_mises_stress_peak_gpa": "von_mises_stress",
+    "youngs_modulus_electrode_gpa": "youngs_modulus",
+    "youngs_modulus_solid_gpa": "youngs_modulus",
+    "youngs_modulus_liquid_gpa": "youngs_modulus",
+    "poissons_ratio_electrode": "poissons_ratio",
+    "poissons_ratio_solid": "poissons_ratio",
+    "poissons_ratio_liquid": "poissons_ratio",
+    "eigenstrain_v1": "eigenstrain",
+    "eigenstrain_v2": "eigenstrain",
+    "eigenstrain_v3": "eigenstrain",
+    "applied_voltage_v": "overpotential",
+    "overpotential_mv": "overpotential",
+    "ionic_concentration_mol_m3": "ionic_concentration",
+    "conductivity_electrode_s_m": "ionic_conductivity",
+    "conductivity_liquid_s_m": "ionic_conductivity",
+    "conductivity_solid_s_m": "ionic_conductivity",
+    "reaction_rate_constant": "butler_volmer_kinetics",
+    "nucleation_perturbation_amplitude": "nucleation_perturbation",
+    "order_parameter_eta_target": "order_parameter_eta",
+    "order_parameter_phi_target": "order_parameter_phi",
+    "gradient_energy_eta": "gradient_energy_coefficient",
+    "gradient_energy_phi": "gradient_energy_coefficient",
+    "barrier_height_eta": "chemical_free_energy",
+    "barrier_height_phi": "chemical_free_energy",
+    "noise_strength": "nucleation_perturbation",
+    "interface_mobility_eta": "mobility",
+    "interface_mobility_phi": "mobility",
+    "chem_curvature_electrode": "chemical_free_energy",
+    "chem_curvature_electrolyte": "chemical_free_energy",
+    "mobility_electrode": "mobility",
+    "mobility_liquid": "mobility",
+    "mobility_solid": "mobility",
+}
+
+
+def get_model_physics(model_name: str) -> Dict[str, Any]:
+    """Return the physics dict for a model, merging hardcoded defaults with
+    any user-uploaded overrides stored in `st.session_state['model_physics_overrides']`."""
+    base = dict(NUMERICAL_MODELS_PHYSICS.get(model_name, {}))
+    overrides = st.session_state.get("model_physics_overrides", {}) if hasattr(st, "session_state") else {}
+    if model_name in overrides:
+        base.update(overrides[model_name])
+    return base
+
+
+def get_all_model_physics() -> Dict[str, Dict[str, Any]]:
+    """Return all 6 models' physics with overrides applied."""
+    return {name: get_model_physics(name) for name in NUMERICAL_MODEL_NAMES}
+
+
+def model_physics_to_text(model_name: str) -> str:
+    """Flatten a model's physics dict into a single text blob for embedding.
+    Used by `associate_models_with_abstracts` to compute model↔abstract similarity."""
+    p = get_model_physics(model_name)
+    parts = [model_name, p.get("description", "")]
+    for k, v in p.items():
+        if k == "description":
+            continue
+        if isinstance(v, bool):
+            parts.append(f"{k}: {v}")
+        elif isinstance(v, (int, float)):
+            parts.append(f"{k}: {v}")
+        else:
+            parts.append(f"{k}: {v}")
+    return ". ".join(parts)
+
+EDGE_COLOR_REGISTRY: Dict[RelationshipType, str] = {
+    # --- Semantic / structural ---
+    RelationshipType.SYNONYM:           "#AAAAAA",
+    RelationshipType.HYPERNYM:          "#5B9BD5",
+    RelationshipType.HYPONYM:           "#5B9BD5",
+    RelationshipType.PART_OF:           "#70AD47",
+    RelationshipType.HAS_PART:          "#70AD47",
+    RelationshipType.CO_OCCURS:         "#BFBFBF",
+
+    # --- Causal / directional ---
+    RelationshipType.CAUSES:            "#FF4444",
+    RelationshipType.RESULTS_IN:        "#E06040",
+    RelationshipType.INFLUENCES:        "#FF8C00",
+    RelationshipType.DEPENDS_ON:        "#DAA520",
+    RelationshipType.CONSTRAINS:        "#CC5500",
+    RelationshipType.MODIFIES:          "#FF6347",
+    RelationshipType.DETERMINES:        "#B8860B",
+    RelationshipType.SUPPRESSES:        "#8B0000",
+    RelationshipType.CORRECTS:          "#CD5C5C",
+    RelationshipType.DRIVES:            "#DC143C",
+    RelationshipType.ENABLES:           "#FF7F50",
+
+    # --- Phase / thermodynamic transitions ---
+    RelationshipType.TRANSITIONS_TO:    "#8A2BE2",
+    RelationshipType.REPLACES:          "#9932CC",
+    RelationshipType.FORMS:             "#9370DB",
+    RelationshipType.STABILIZES:        "#7B68EE",
+    RelationshipType.PRESERVES:         "#6A5ACD",
+
+    # --- Computation / modeling ---
+    RelationshipType.TRAINS:            "#00CED1",
+    RelationshipType.OUTPUTS:           "#20B2AA",
+    RelationshipType.LEARNS:            "#48D1CC",
+    RelationshipType.CAPTURES:          "#40E0D0",
+    RelationshipType.COMPUTES:          "#008B8B",
+    RelationshipType.SIMULATES:         "#5F9EA0",
+    RelationshipType.MODELS:            "#4682B4",
+    RelationshipType.APPROXIMATES:      "#87CEEB",
+    RelationshipType.MAPS:              "#00BFFF",
+
+    # --- Analysis / evaluation ---
+    RelationshipType.QUANTIFIES:        "#32CD32",
+    RelationshipType.EVALUATES:         "#228B22",
+    RelationshipType.COMPARES:          "#3CB371",
+    RelationshipType.VALIDATES:         "#2E8B57",
+    RelationshipType.AVERAGES:          "#66CDAA",
+    RelationshipType.CORRELATES:        "#00FA9A",
+
+    # --- Structural / architectural ---
+    RelationshipType.PARALLELIZES:      "#FFD700",
+    RelationshipType.POSITIONS:         "#FFC125",
+    RelationshipType.IDENTIFIES:        "#F0E68C",
+    RelationshipType.PROCESSES:         "#EEE8AA",
+    RelationshipType.GROUPS:            "#DAA520",
+    RelationshipType.INTEGRATES:        "#B8860B",
+    RelationshipType.COUPLES:           "#CD950C",
+
+    # --- Discovery / optimization ---
+    RelationshipType.DISCOVERS:         "#FF69B4",
+    RelationshipType.PRE_TRAINS:        "#FF1493",
+    RelationshipType.GENERALIZES:       "#DB7093",
+    RelationshipType.QUERIES:           "#C71585",
+    RelationshipType.OPTIMIZES:         "#FF00FF",
+    RelationshipType.DESIGNS:           "#BA55D3",
+    RelationshipType.CONSTRUCTS:        "#DA70D6",
+
+    # --- Advanced modeling ---
+    RelationshipType.UPSCALES:          "#8B4513",
+    RelationshipType.RESOLVES:          "#A0522D",
+    RelationshipType.SYNCHRONIZES:      "#D2691E",
+    RelationshipType.CHARACTERIZES:     "#CD853F",
+    RelationshipType.DECOMPOSES:        "#DEB887",
+    RelationshipType.FRAMES:            "#D2B48C",
+    RelationshipType.COMPOSES:          "#BC8F8F",
+    RelationshipType.QUALIFIES:         "#F4A460",
+
+    # --- Explanation / visualization ---
+    RelationshipType.STRENGTHENS:       "#7FFF00",
+    RelationshipType.EXPLAINS:          "#ADFF2F",
+    RelationshipType.INTERPRETS:        "#7CFC00",
+    RelationshipType.VISUALIZES:        "#00FF7F",
+    RelationshipType.ACCELERATES:       "#98FB98",
+    RelationshipType.ENFORCES:          "#90EE90",
+
+    # --- Generic fallback ---
+    RelationshipType.SEMANTIC:          "#808080",
+    RelationshipType.INFERRED:          "#A9A9A9",
+    RelationshipType.BRIDGE:            "#C0C0C0",
+    RelationshipType.SELECTS:           "#D3D3D3",
+    RelationshipType.INITIATES:         "#696969",
+    RelationshipType.DETECTS:           "#556B2F",
+    RelationshipType.GENERATES:         "#6B8E23",
+}
+
+EDGE_COLOR_FALLBACK = "#888888"
+
+
+def get_edge_color(rel_type: RelationshipType) -> str:
+    return EDGE_COLOR_REGISTRY.get(rel_type, EDGE_COLOR_FALLBACK)
+
+
+def get_edge_width(rel_type: RelationshipType) -> float:
+    STRONG = {RelationshipType.CAUSES, RelationshipType.DRIVES,
+              RelationshipType.FORMS, RelationshipType.STABILIZES,
+              RelationshipType.DEPENDS_ON, RelationshipType.CONSTRAINS}
+    MEDIUM = {RelationshipType.INFLUENCES, RelationshipType.RESULTS_IN,
+              RelationshipType.MODIFIES, RelationshipType.ENABLES,
+              RelationshipType.TRANSITIONS_TO, RelationshipType.COMPUTES}
+    if rel_type in STRONG:
+        return 3.0
+    elif rel_type in MEDIUM:
+        return 2.0
+    return 1.0
+
+
+def get_edge_style(rel_type: RelationshipType) -> str:
+    DASHED = {RelationshipType.INFERRED, RelationshipType.CO_OCCURS,
+              RelationshipType.SEMANTIC, RelationshipType.BRIDGE}
+    return "dashed" if rel_type in DASHED else "solid"
+
+
+def lighten_hex_color(hex_color: str, factor: float) -> str:
+    if not hex_color.startswith('#'):
+        return hex_color
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    r = int(r + (255 - r) * factor)
+    g = int(g + (255 - g) * factor)
+    b = int(b + (255 - b) * factor)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+@dataclass
+class ConceptNode:
+    canonical_name: str
+    concept_type: ConceptType
+    synonyms: Set[str] = field(default_factory=set)
+    hypernyms: Set[str] = field(default_factory=set)
+    hyponyms: Set[str] = field(default_factory=set)
+    related_processes: Set[str] = field(default_factory=set)
+    related_properties: Set[str] = field(default_factory=set)
+    definition: str = ""
+    embedding: Optional[np.ndarray] = None
+
+    def add_synonym(self, synonym: str) -> None:
+        self.synonyms.add(synonym.lower().strip())
+
+    def is_match(self, text: str) -> bool:
+        text_lower = text.lower().strip()
+        if text_lower == self.canonical_name.lower():
+            return True
+        return text_lower in self.synonyms
+
+
+@dataclass
+class Relationship:
+    source: str
+    target: str
+    rel_type: RelationshipType
+    confidence: float = 1.0
+    evidence: str = ""
+    inferred: bool = False
+
+
+class DomainOntology:
+    """Comprehensive ontology for Dendrite Growth in Partitioned Electrolytes."""
+
+    def __init__(self) -> None:
+        self.concepts: Dict[str, ConceptNode] = {}
+        self.relationships: List[Relationship] = []
+        self._build_ontology()
+
+    def _build_ontology(self) -> None:
+        # === 1. Phases & Materials ===
+        self._add_concept("lithium_metal", ConceptType.MATERIAL,
+            synonyms={"li metal", "anode", "lithium anode", "li anode", "electrode phase"},
+            definition="The electrode phase where lithium deposits, represented by order parameter eta=1.")
+        self._add_concept("liquid_electrolyte", ConceptType.MATERIAL,
+            synonyms={"le", "lipf6", "liquid phase", "electrolyte solution"},
+            definition="The conductive liquid medium allowing ion transport, phi=0.")
+        self._add_concept("solid_partition", ConceptType.MATERIAL,
+            synonyms={"solid electrolyte", "sse", "llzo", "inclusion", "partition", "static solid"},
+            definition="Static solid structures that partition the liquid electrolyte, phi=1.")
+        self._add_concept("llzo_solid_electrolyte", ConceptType.MATERIAL,
+            synonyms={"llzo", "garnet", "li7la3zr2o12"},
+            definition="Garnet-structure solid electrolyte (Li7La3Zr2O12) used as stiff, ion-conducting partitions.")
+        self._add_concept("lipf6_liquid_electrolyte", ConceptType.MATERIAL,
+            synonyms={"lipf6", "carbonate electrolyte", "liquid electrolyte salt"},
+            definition="Liquid carbonate electrolyte (LiPF6) providing the ion-conducting medium between partitions.")
+
+        # === 2. Geometric & Structural Properties ===
+        self._add_concept("solid_liquid_ratio", ConceptType.PARAMETER,
+            synonyms={"s/l ratio", "phase fraction", "volume fraction", "solid fraction"},
+            definition="The ratio of solid phase area to liquid phase area in the electrolyte.")
+        self._add_concept("spatial_configuration", ConceptType.PARAMETER,
+            synonyms={"geometry", "architecture", "distribution", "arrangement"},
+            definition="The spatial arrangement of solid partitions (e.g., horizontal, vertical, random).")
+        self._add_concept("horizontal_layering", ConceptType.MICROSTRUCTURE,
+            synonyms={"model a", "model d", "layered geometry", "horizontal layers"},
+            definition="Geometry where solid and liquid phases are arranged in horizontal layers.")
+        self._add_concept("vertical_stripes", ConceptType.MICROSTRUCTURE,
+            synonyms={"model b", "model e", "stripe geometry", "vertical stripes"},
+            definition="Geometry with alternating vertical stripes of solid and liquid.")
+        self._add_concept("random_inclusions", ConceptType.MICROSTRUCTURE,
+            synonyms={"model c", "model f", "random distribution", "dispersed inclusions"},
+            definition="Geometry with randomly distributed solid inclusions in the liquid matrix.")
+        self._add_concept("domain_size", ConceptType.PARAMETER,
+            synonyms={"domain length", "simulation domain", "mesh size"},
+            definition="Characteristic length scale of the simulation domain over which dendrite growth is evaluated.")
+        self._add_concept("solid_liquid_interface", ConceptType.MICROSTRUCTURE,
+            synonyms={"interface", "phase boundary", "s-l interface"},
+            definition="The diffuse boundary between solid partition and liquid electrolyte where growth resistance localizes.")
+        self._add_concept("geometric_confinement", ConceptType.PROCESS,
+            synonyms={"confinement", "physical barrier", "spatial confinement"},
+            definition="Physical restriction of dendrite propagation imposed by the geometry of solid partitions.")
+
+        # === 3. Phase & Mechanical Properties ===
+        self._add_concept("youngs_modulus", ConceptType.PROPERTY,
+            synonyms={"elastic modulus", "stiffness", "e", "modulus"},
+            definition="Mechanical stiffness of the phase, interpolated across the domain via the order parameters.")
+        self._add_concept("poissons_ratio", ConceptType.PROPERTY,
+            synonyms={"nu", "compressibility", "poisson ratio"},
+            definition="Ratio of transverse to axial strain, approaching 0.5 for the liquid phase.")
+        self._add_concept("eigenstrain", ConceptType.PROPERTY,
+            synonyms={"volumetric expansion", "misfit strain", "stress-free strain"},
+            definition="Phase-dependent strain representing volumetric expansion during lithium deposition.")
+        self._add_concept("ionic_conductivity", ConceptType.PROPERTY,
+            synonyms={"conductivity", "ion transport", "sigma"},
+            definition="Ability of the electrolyte phase to conduct lithium ions, governing the ionic current distribution.")
+        self._add_concept("mobility", ConceptType.PROPERTY,
+            synonyms={"phase mobility", "interface mobility", "kinetic coefficient"},
+            definition="Kinetic coefficient controlling the rate of order-parameter relaxation at the interface.")
+
+        # === 4. Phase Field Variables ===
+        self._add_concept("order_parameter_eta", ConceptType.PARAMETER,
+            synonyms={"eta", "electrode phase", "electrode order parameter"},
+            definition="Non-conserved order parameter distinguishing electrode (1) from electrolyte (0).")
+        self._add_concept("order_parameter_phi", ConceptType.PARAMETER,
+            synonyms={"phi", "solid phase", "partition order parameter"},
+            definition="Non-conserved order parameter distinguishing solid partitions (1) from liquid (0).")
+        self._add_concept("chemical_free_energy", ConceptType.PROPERTY,
+            synonyms={"f_chem", "bulk free energy", "chemical potential"},
+            definition="Bulk free-energy density driving lithium deposition, a function of eta and concentration.")
+        self._add_concept("mechanical_free_energy", ConceptType.PROPERTY,
+            synonyms={"f_mech", "elastic energy", "strain energy"},
+            definition="Energy arising from elastic strain due to dendrite growth into the electrolyte.")
+        self._add_concept("gradient_energy_coefficient", ConceptType.PROPERTY,
+            synonyms={"kappa", "gradient coefficient", "interface energy"},
+            definition="Coefficient penalizing spatial gradients of the order parameter, setting interface thickness.")
+        self._add_concept("elastic_strain_energy", ConceptType.PROPERTY,
+            synonyms={"strain energy", "elastic energy density"},
+            definition="Stored elastic energy density that raises the barrier for further lithium deposition.")
+        self._add_concept("thermodynamic_equilibrium", ConceptType.PHENOMENON,
+            synonyms={"equilibrium", "steady state", "min energy"},
+            definition="State where the free-energy functional is minimized with respect to the order parameters.")
+
+        # === 5. Electrochemical Kinetics ===
+        self._add_concept("butler_volmer_kinetics", ConceptType.METHOD,
+            synonyms={"butler-volmer", "bv kinetics", "electrode kinetics"},
+            definition="Charge-transfer relation describing the electrode current as a function of overpotential.")
+        self._add_concept("overpotential", ConceptType.PARAMETER,
+            synonyms={"over-potential", "eta electrochem", "voltage driving force"},
+            definition="Voltage departure from equilibrium that drives lithium deposition at the electrode interface.")
+        self._add_concept("ionic_concentration", ConceptType.PARAMETER,
+            synonyms={"concentration", "li+ concentration", "salt concentration"},
+            definition="Local lithium-ion concentration in the electrolyte, coupled to the order parameters.")
+        self._add_concept("nucleation_perturbation", ConceptType.PROCESS,
+            synonyms={"nucleation", "seed", "perturbation", "initial perturbation"},
+            definition="Small initial perturbation of the order parameter that seeds dendrite initiation.")
+
+        # === 6. Mechanical Constraints & Target Metrics ===
+        self._add_concept("von_mises_stress", ConceptType.PROPERTY,
+            synonyms={"stress distribution", "mechanical constraint", "vm stress"},
+            definition="Stress distribution map showing mechanical resistance at solid-liquid interfaces.")
+        self._add_concept("mechanical_suppression", ConceptType.PROCESS,
+            synonyms={"stress blocking", "mechanical blocking", "growth suppression"},
+            definition="Halt of dendrite propagation caused by stress-induced elevation of the free-energy barrier.")
+        self._add_concept("dendrite_length", ConceptType.PROPERTY,
+            synonyms={"penetration length", "max length", "l_d", "tip distance"},
+            definition="Maximum distance the dendrite tip reaches in the primary growth direction.")
+        self._add_concept("dendrite_area", ConceptType.PROPERTY,
+            synonyms={"net area", "area fraction", "a_d", "deposited area"},
+            definition="Net increase in lithium area relative to the initial state, calculated via interpolation function h(eta).")
+        self._add_concept("dendrite_growth", ConceptType.PHENOMENON,
+            synonyms={"dendrite propagation", "growth", "dendrite formation"},
+            definition="Propagation of the electrode phase into the electrolyte, the central phenomenon under study.")
+
+        # === 7. Methods & Cross-cutting ===
+        self._add_concept("phase_field_method", ConceptType.METHOD,
+            synonyms={"phase field", "pf method", "variational method"},
+            definition="Variational modeling framework that evolves order parameters to minimize a free-energy functional.")
+        self._add_concept("multiphysics_coupling", ConceptType.METHOD,
+            synonyms={"coupled multiphysics", "multi-physics", "coupled simulation"},
+            definition="Coupled solution of electrochemical, mechanical, and phase-field governing equations.")
+        self._add_concept("finite_element_analysis", ConceptType.METHOD,
+            synonyms={"fea", "fem", "finite element"},
+            definition="Numerical method used to solve the mechanical equilibrium and compute stress fields.")
+        self._add_concept("dead_lithium_formation", ConceptType.PHENOMENON,
+            synonyms={"dead li", "isolated lithium", "dead lithium"},
+            definition="Electrically isolated lithium formed when dendrites detach, reducing reversible capacity.")
+        self._add_concept("cycle_life_degradation", ConceptType.PHENOMENON,
+            synonyms={"degradation", "capacity fade", "aging"},
+            definition="Loss of reversible capacity over cycles, accelerated by dendrite-induced dead lithium.")
+
+        # === 8. v6.3 — Numerical Models A–F (ConceptType.MODEL) ===
+        # Each model is a specific combination of geometry × S/L ratio.
+        # Canonical physics lives in NUMERICAL_MODELS_PHYSICS; the ontology
+        # node carries the qualitative description and the synonym matches
+        # so that "Model A", "model a", "model_a", and the geometry+S/L
+        # phrase "boundary layer 4:1" all resolve to the same node.
+        # v6.3.1: Geometry descriptions updated to match the FINALIZED figure
+        # caption of Fig.1 (boundary_layer / alternating_layers / central_layer).
+        self._add_concept("model_a", ConceptType.MODEL,
+            synonyms={"model a", "model_a", "boundary layer 4:1", "boundary 4 1", "solid-electrolyte boundary layer 4:1"},
+            definition="Model A: solid-electrolyte boundary layer, S/L=4:1 (80% solid). Strong directional confinement; side-branch growth suppressed; dendrite reaches 88% of inter-electrode gap at t=710s. Peak von Mises stress 0.059 GPa. Area fraction 3.6%.")
+        self._add_concept("model_b", ConceptType.MODEL,
+            synonyms={"model b", "model_b", "alternating layers 2:3", "alternating 2 3", "alternating electrolyte layers 2:3"},
+            definition="Model B: alternating electrolyte layers, S/L=2:3 (40% solid). Lower solid fraction; numerous side branches; max dendrite length >90% at t=793s. Area fraction 5.8%.")
+        self._add_concept("model_c", ConceptType.MODEL,
+            synonyms={"model c", "model_c", "central layer 4:1", "central 4 1", "central solid-electrolyte layer 4:1"},
+            definition="Model C: central solid-electrolyte layer, S/L=4:1 (80% solid). Same S/L as Model A but different geometry. Needle-like dendrite with few side branches; longest max dendrite length (97%) but lowest area fraction (2.9%) at t=1037s.")
+        self._add_concept("model_d", ConceptType.MODEL,
+            synonyms={"model d", "model_d", "boundary layer 3:2", "boundary 3 2", "solid-electrolyte boundary layer 3:2"},
+            definition="Model D: solid-electrolyte boundary layer, S/L=3:2 (60% solid). Similar pattern to Model A but with thicker liquid region. Insufficient solid to fully restrict vertical growth; more side branches. Max length ~90% at t=750s. Area fraction 3.3%.")
+        self._add_concept("model_e", ConceptType.MODEL,
+            synonyms={"model e", "model_e", "alternating layers 1:4", "alternating 1 4", "alternating electrolyte layers 1:4"},
+            definition="Model E: alternating electrolyte layers, S/L=1:4 (20% solid). Smallest solid electrolyte proportion; significantly stronger branches; highest area fraction (8.8%); max length >90% at t=671s.")
+        self._add_concept("model_f", ConceptType.MODEL,
+            synonyms={"model f", "model_f", "central layer 2:3", "central 2 3", "central solid-electrolyte layer 2:3"},
+            definition="Model F: central solid-electrolyte layer, S/L=2:3 (40% solid). Similar structure to Model C but with thinner central solid layer and lower solid fraction. Max dendrite length 93% at t=2359s (longest time). Area fraction 4.1%.")
+
+        # === 9. v6.3.1 — Geometry subtypes (MICROSTRUCTURE) ===
+        # Three distinct spatial configurations from the manuscript figure caption.
+        # These are more specific than the generic horizontal_layering / vertical_stripes
+        # / random_inclusions concepts and accurately reflect the manuscript's
+        # finalized Fig.1 caption terminology.
+        self._add_concept("boundary_layer", ConceptType.MICROSTRUCTURE,
+            synonyms={"solid-electrolyte boundary layer", "boundary layer geometry", "boundary solid layer"},
+            definition="Geometry where solid electrolyte partitions are placed at the boundary of the liquid electrolyte region (Models A and D). Creates strong directional confinement for dendrite growth.")
+        self._add_concept("alternating_layers", ConceptType.MICROSTRUCTURE,
+            synonyms={"alternating electrolyte layers", "alternating solid-liquid layers", "interleaved layers"},
+            definition="Geometry with alternating solid and liquid electrolyte layers (Models B and E). Breaks up the continuity of liquid channels, redistributing ionic current.")
+        self._add_concept("central_layer", ConceptType.MICROSTRUCTURE,
+            synonyms={"central solid-electrolyte layer", "central solid layer", "central partition"},
+            definition="Geometry where a solid electrolyte layer is positioned centrally within the liquid electrolyte (Models C and F). Creates a barrier that dendrites must navigate around.")
+
+        # Build synonym index and causal chains from the four pillars
+        self._build_synonym_index()
+        self._build_causal_chains()
+
+    def _add_concept(
+        self,
+        canonical_name: str,
+        concept_type: ConceptType,
+        synonyms: Set[str] = None,
+        hypernyms: Set[str] = None,
+        hyponyms: Set[str] = None,
+        definition: str = "",
+        related_processes: Set[str] = None,
+        related_properties: Set[str] = None,
+    ) -> None:
+        node = ConceptNode(
+            canonical_name=canonical_name,
+            concept_type=concept_type,
+            synonyms=synonyms or set(),
+            hypernyms=hypernyms or set(),
+            hyponyms=hyponyms or set(),
+            related_processes=related_processes or set(),
+            related_properties=related_properties or set(),
+            definition=definition,
+        )
+        self.concepts[canonical_name] = node
+
+    def _build_synonym_index(self) -> None:
+        self.synonym_to_canonical: Dict[str, str] = {}
+        for canonical, node in self.concepts.items():
+            self.synonym_to_canonical[canonical.lower()] = canonical
+            for syn in node.synonyms:
+                self.synonym_to_canonical[syn.lower()] = canonical
+
+    def _build_causal_chains(self) -> None:
+        causal_chains = [
+            # Geometry -> Growth Metrics
+            ("solid_liquid_ratio", RelationshipType.CONSTRAINS, "dendrite_area", 0.90),
+            ("solid_liquid_ratio", RelationshipType.CONSTRAINS, "dendrite_length", 0.85),
+            ("spatial_configuration", RelationshipType.DETERMINES, "dendrite_length", 0.80),
+            ("horizontal_layering", RelationshipType.SUPPRESSES, "dendrite_growth", 0.75),
+            ("vertical_stripes", RelationshipType.SUPPRESSES, "dendrite_growth", 0.70),
+            ("random_inclusions", RelationshipType.CONSTRAINS, "dendrite_length", 0.65),
+            ("domain_size", RelationshipType.BOUNDS, "dendrite_length", 0.60),
+            ("solid_liquid_interface", RelationshipType.DETERMINES, "dendrite_length", 0.75),
+
+            # Phase Properties -> Mechanics
+            ("youngs_modulus", RelationshipType.INFLUENCES, "von_mises_stress", 0.90),
+            ("poissons_ratio", RelationshipType.MODIFIES, "mechanical_free_energy", 0.70),
+            ("eigenstrain", RelationshipType.CAUSES, "mechanical_free_energy", 0.85),
+            ("ionic_conductivity", RelationshipType.INFLUENCES, "dendrite_growth", 0.80),
+
+            # Mechanics -> Growth Suppression
+            ("von_mises_stress", RelationshipType.CONSTRAINS, "order_parameter_eta", 0.85),
+            ("mechanical_free_energy", RelationshipType.SUPPRESSES, "dendrite_area", 0.80),
+            ("mechanical_suppression", RelationshipType.CONSTRAINS, "dendrite_growth", 0.90),
+            ("geometric_confinement", RelationshipType.CONSTRAINS, "dendrite_length", 0.85),
+            ("elastic_strain_energy", RelationshipType.INFLUENCES, "mechanical_free_energy", 0.80),
+
+            # Phase Field Logic
+            ("order_parameter_phi", RelationshipType.SUPPRESSES, "order_parameter_eta", 0.95),
+            ("solid_partition", RelationshipType.CONSTRAINS, "lithium_metal", 0.90),
+            ("order_parameter_eta", RelationshipType.DRIVES, "dendrite_growth", 0.88),
+            ("gradient_energy_coefficient", RelationshipType.MODIFIES, "dendrite_growth", 0.65),
+
+            # Electrochemical Kinetics
+            ("butler_volmer_kinetics", RelationshipType.DRIVES, "overpotential", 0.85),
+            ("overpotential", RelationshipType.DRIVES, "dendrite_growth", 0.85),
+            ("ionic_concentration", RelationshipType.INFLUENCES, "overpotential", 0.75),
+            ("nucleation_perturbation", RelationshipType.INITIATES, "dendrite_growth", 0.80),
+            ("chemical_free_energy", RelationshipType.DRIVES, "dendrite_growth", 0.82),
+
+            # Materials
+            ("lithium_metal", RelationshipType.FORMS, "dendrite_growth", 0.90),
+            ("liquid_electrolyte", RelationshipType.ENABLES, "dendrite_growth", 0.70),
+            ("llzo_solid_electrolyte", RelationshipType.SUPPRESSES, "dendrite_growth", 0.78),
+            ("lipf6_liquid_electrolyte", RelationshipType.ENABLES, "ionic_conductivity", 0.80),
+
+            # Degradation
+            ("dendrite_growth", RelationshipType.CAUSES, "dead_lithium_formation", 0.80),
+            ("dendrite_growth", RelationshipType.CAUSES, "cycle_life_degradation", 0.85),
+
+            # Methods
+            ("phase_field_method", RelationshipType.MODELS, "dendrite_growth", 0.92),
+            ("multiphysics_coupling", RelationshipType.COUPLES, "mechanical_free_energy", 0.80),
+            ("finite_element_analysis", RelationshipType.COMPUTES, "von_mises_stress", 0.85),
+
+            # === v6.3.1 — Numerical Models A–F → physics concepts ===
+            # Each model DETERMINES its geometry subtype, CONSTRAINS its S/L ratio,
+            # DETERMINES dendrite_length and dendrite_area, and SUPPRESSES (or not)
+            # dendrite_growth depending on its physics.
+            # Confidence values reflect the actual manuscript measurements:
+            #   - dendrite_length confidence = max_dendrite_length_pct
+            #   - dendrite_area confidence = normalized area fraction
+            #   - SUPPRESSES confidence = inverse of branch_count / 6
+            #   - MODELS von_mises_stress confidence = normalized stress
+
+            # Model A: boundary_layer, S/L=4:1, 80% solid, length=88%, area=3.6%, stress=0.059 GPa
+            ("model_a", RelationshipType.DETERMINES, "boundary_layer", 0.95),
+            ("model_a", RelationshipType.CONSTRAINS, "solid_liquid_ratio", 0.90),    # S/L=4:1
+            ("model_a", RelationshipType.DETERMINES, "dendrite_length", 0.88),       # 88%
+            ("model_a", RelationshipType.DETERMINES, "dendrite_area", 0.036),        # 3.6%
+            ("model_a", RelationshipType.SUPPRESSES, "dendrite_growth", 0.75),       # side branches suppressed
+            ("model_a", RelationshipType.MODELS, "von_mises_stress", 0.95),          # 0.059 GPa (max)
+
+            # Model B: alternating_layers, S/L=2:3, 40% solid, length=>90%, area=5.8%, stress=~0.025 GPa
+            ("model_b", RelationshipType.DETERMINES, "alternating_layers", 0.95),
+            ("model_b", RelationshipType.CONSTRAINS, "solid_liquid_ratio", 0.60),    # S/L=2:3
+            ("model_b", RelationshipType.DETERMINES, "dendrite_length", 0.92),       # >90%
+            ("model_b", RelationshipType.DETERMINES, "dendrite_area", 0.058),        # 5.8%
+            ("model_b", RelationshipType.SUPPRESSES, "dendrite_growth", 0.40),       # numerous side branches
+            ("model_b", RelationshipType.MODELS, "von_mises_stress", 0.45),          # ~0.025 GPa
+
+            # Model C: central_layer, S/L=4:1, 80% solid, length=97%, area=2.9%, stress=~0.050 GPa
+            ("model_c", RelationshipType.DETERMINES, "central_layer", 0.95),
+            ("model_c", RelationshipType.CONSTRAINS, "solid_liquid_ratio", 0.90),    # S/L=4:1
+            ("model_c", RelationshipType.DETERMINES, "dendrite_length", 0.97),       # 97% (highest)
+            ("model_c", RelationshipType.DETERMINES, "dendrite_area", 0.029),        # 2.9% (lowest)
+            ("model_c", RelationshipType.SUPPRESSES, "dendrite_growth", 0.85),       # needle-like, few side branches
+            ("model_c", RelationshipType.MODELS, "von_mises_stress", 0.85),          # ~0.050 GPa
+
+            # Model D: boundary_layer, S/L=3:2, 60% solid, length=~90%, area=3.3%, stress=~0.035 GPa
+            ("model_d", RelationshipType.DETERMINES, "boundary_layer", 0.90),
+            ("model_d", RelationshipType.CONSTRAINS, "solid_liquid_ratio", 0.75),    # S/L=3:2
+            ("model_d", RelationshipType.DETERMINES, "dendrite_length", 0.90),       # ~90%
+            ("model_d", RelationshipType.DETERMINES, "dendrite_area", 0.033),        # 3.3%
+            ("model_d", RelationshipType.SUPPRESSES, "dendrite_growth", 0.30),       # more side branches
+            ("model_d", RelationshipType.MODELS, "von_mises_stress", 0.60),          # ~0.035 GPa
+
+            # Model E: alternating_layers, S/L=1:4, 20% solid, length=>90%, area=8.8%, stress=~0.015 GPa
+            ("model_e", RelationshipType.DETERMINES, "alternating_layers", 0.90),
+            ("model_e", RelationshipType.CONSTRAINS, "solid_liquid_ratio", 0.40),    # S/L=1:4
+            ("model_e", RelationshipType.DETERMINES, "dendrite_length", 0.92),       # >90%
+            ("model_e", RelationshipType.DETERMINES, "dendrite_area", 0.088),        # 8.8% (highest)
+            ("model_e", RelationshipType.SUPPRESSES, "dendrite_growth", 0.20),       # significantly stronger branches
+            ("model_e", RelationshipType.MODELS, "von_mises_stress", 0.25),          # ~0.015 GPa (lowest)
+
+            # Model F: central_layer, S/L=2:3, 40% solid, length=93%, area=4.1%, stress=~0.030 GPa
+            ("model_f", RelationshipType.DETERMINES, "central_layer", 0.90),
+            ("model_f", RelationshipType.CONSTRAINS, "solid_liquid_ratio", 0.60),    # S/L=2:3
+            ("model_f", RelationshipType.DETERMINES, "dendrite_length", 0.93),       # 93%
+            ("model_f", RelationshipType.DETERMINES, "dendrite_area", 0.041),        # 4.1%
+            ("model_f", RelationshipType.SUPPRESSES, "dendrite_growth", 0.55),       # partial suppression (similar to C)
+            ("model_f", RelationshipType.MODELS, "von_mises_stress", 0.50),          # ~0.030 GPa
+
+            # Each model also DRIVES the electrochemical overpotential (shared
+            # operating condition U1=-0.45V) and is BOUNDED by the domain size.
+            ("model_a", RelationshipType.DRIVES, "overpotential", 0.60),
+            ("model_b", RelationshipType.DRIVES, "overpotential", 0.60),
+            ("model_c", RelationshipType.DRIVES, "overpotential", 0.60),
+            ("model_d", RelationshipType.DRIVES, "overpotential", 0.60),
+            ("model_e", RelationshipType.DRIVES, "overpotential", 0.60),
+            ("model_f", RelationshipType.DRIVES, "overpotential", 0.60),
+            ("domain_size", RelationshipType.BOUNDS, "model_a", 0.50),
+            ("domain_size", RelationshipType.BOUNDS, "model_b", 0.50),
+            ("domain_size", RelationshipType.BOUNDS, "model_c", 0.50),
+            ("domain_size", RelationshipType.BOUNDS, "model_d", 0.50),
+            ("domain_size", RelationshipType.BOUNDS, "model_e", 0.50),
+            ("domain_size", RelationshipType.BOUNDS, "model_f", 0.50),
+        ]
+        for source, rel_type, target, confidence in causal_chains:
+            self.relationships.append(
+                Relationship(source, target, rel_type, abs(confidence))
+            )
+
+    def resolve_concept(self, text: str) -> Optional[str]:
+        text_lower = text.lower().strip()
+        if text_lower in self.synonym_to_canonical:
+            return self.synonym_to_canonical[text_lower]
+        normalized = self._normalize_text(text_lower)
+        if normalized in self.synonym_to_canonical:
+            return self.synonym_to_canonical[normalized]
+        variants = [
+            text_lower.replace("-", " "),
+            text_lower.replace(" ", "-"),
+            text_lower.replace(" of ", " "),
+            text_lower.replace(" for ", " "),
+            text_lower.replace(" in ", " "),
+            re.sub(r'\bs\b', '', text_lower),
+            re.sub(r'\bes\b', '', text_lower),
+        ]
+        for variant in variants:
+            if variant in self.synonym_to_canonical:
+                return self.synonym_to_canonical[variant]
+        return None
+
+    def _normalize_text(self, text: str) -> str:
+        text = re.sub(
+            r'\b(the|a|an|of|for|in|with|by|to|and|or|on|at)\b', ' ', text
+        )
+        text = ' '.join(text.split())
+        return text.strip()
+
+    def get_concept_type(self, canonical_name: str) -> ConceptType:
+        if canonical_name in self.concepts:
+            return self.concepts[canonical_name].concept_type
+        return ConceptType.GENERAL
+
+    def get_hypernyms(self, canonical_name: str) -> Set[str]:
+        if canonical_name in self.concepts:
+            return self.concepts[canonical_name].hypernyms
+        return set()
+
+    def get_hyponyms(self, canonical_name: str) -> Set[str]:
+        if canonical_name in self.concepts:
+            return self.concepts[canonical_name].hyponyms
+        return set()
+
+    def get_definition(self, canonical_name: str) -> str:
+        if canonical_name in self.concepts:
+            return self.concepts[canonical_name].definition
+        return ""
+
+    def infer_path(
+        self, source: str, target: str, max_depth: int = 3
+    ) -> List[List[str]]:
+        paths: List[List[str]] = []
+        visited: Set[str] = set()
+
+        def dfs(current: str, target: str, path: List[str], depth: int) -> None:
+            if depth > max_depth:
+                return
+            if current == target:
+                paths.append(path.copy())
+                return
+            if current in visited:
+                return
+            visited.add(current)
+            for rel in self.relationships:
+                if rel.source == current and rel.confidence > 0.5:
+                    path.append(rel.target)
+                    dfs(rel.target, target, path, depth + 1)
+                    path.pop()
+            if current in self.concepts:
+                for hyp in self.concepts[current].hypernyms:
+                    path.append(hyp)
+                    dfs(hyp, target, path, depth + 1)
+                    path.pop()
+            visited.remove(current)
+
+        dfs(source, target, [source], 0)
+        return paths
+
+    def get_related_concepts(
+        self, canonical_name: str, rel_type: RelationshipType = None
+    ) -> List[Tuple[str, RelationshipType, float]]:
+        related: List[Tuple[str, RelationshipType, float]] = []
+        for rel in self.relationships:
+            if rel.source == canonical_name:
+                if rel_type is None or rel.rel_type == rel_type:
+                    related.append((rel.target, rel.rel_type, rel.confidence))
+            elif rel.target == canonical_name:
+                if rel_type is None or rel.rel_type == rel_type:
+                    related.append((rel.source, rel.rel_type, rel.confidence))
+        return related
+
+
+def ensure_ontology_populated() -> "DomainOntology":
+    """
+    Returns a fully populated DomainOntology instance, re-initialising it if necessary.
+    """
+    if "ontology" not in st.session_state or not st.session_state.ontology.concepts:
+        st.session_state.ontology = DomainOntology()
+
+    ontology = st.session_state.ontology
+    has_property = any(node.concept_type == ConceptType.PROPERTY for node in ontology.concepts.values())
+    if not has_property:
+        st.session_state.ontology = DomainOntology()
+    return st.session_state.ontology
+
+
+# ============================================================================
+# HIERARCHY LABEL BUILDER — enriches flat concept names with ancestor path
+# ============================================================================
+
+_HIERARCHY_PARENTS: Dict[str, Tuple[str, int]] = {
+    # Roots (tier 0)
+    "dendrite_growth": (None, 0),
+    "phase_field_method": (None, 0),
+    # Tier 1: Structural Geometry
+    "solid_liquid_ratio": ("Structural Geometry", 1),
+    "spatial_configuration": ("Structural Geometry", 1),
+    "horizontal_layering": ("Structural Geometry", 1),
+    "vertical_stripes": ("Structural Geometry", 1),
+    "random_inclusions": ("Structural Geometry", 1),
+    "domain_size": ("Structural Geometry", 1),
+    "solid_liquid_interface": ("Structural Geometry", 1),
+    "geometric_confinement": ("Structural Geometry", 1),
+    "dendrite_length": ("Structural Geometry", 1),
+    "dendrite_area": ("Structural Geometry", 1),
+    # Tier 1: Phase Properties
+    "lithium_metal": ("Phase Properties", 1),
+    "liquid_electrolyte": ("Phase Properties", 1),
+    "solid_partition": ("Phase Properties", 1),
+    "llzo_solid_electrolyte": ("Phase Properties", 1),
+    "lipf6_liquid_electrolyte": ("Phase Properties", 1),
+    "order_parameter_eta": ("Phase Properties", 1),
+    "order_parameter_phi": ("Phase Properties", 1),
+    "youngs_modulus": ("Phase Properties", 1),
+    "poissons_ratio": ("Phase Properties", 1),
+    "ionic_conductivity": ("Phase Properties", 1),
+    "mobility": ("Phase Properties", 1),
+    "gradient_energy_coefficient": ("Phase Properties", 1),
+    "multiphysics_coupling": ("Phase Properties", 1),
+    # Tier 1: Electrochemical Kinetics
+    "chemical_free_energy": ("Electrochemical Kinetics", 1),
+    "butler_volmer_kinetics": ("Electrochemical Kinetics", 1),
+    "overpotential": ("Electrochemical Kinetics", 1),
+    "ionic_concentration": ("Electrochemical Kinetics", 1),
+    "nucleation_perturbation": ("Electrochemical Kinetics", 1),
+    "thermodynamic_equilibrium": ("Electrochemical Kinetics", 1),
+    "dead_lithium_formation": ("Electrochemical Kinetics", 1),
+    "cycle_life_degradation": ("Electrochemical Kinetics", 1),
+    # Tier 1: Mechanical Constraints
+    "mechanical_free_energy": ("Mechanical Constraints", 1),
+    "elastic_strain_energy": ("Mechanical Constraints", 1),
+    "von_mises_stress": ("Mechanical Constraints", 1),
+    "eigenstrain": ("Mechanical Constraints", 1),
+    "mechanical_suppression": ("Mechanical Constraints", 1),
+    "finite_element_analysis": ("Mechanical Constraints", 1),
+    # Tier 1: Numerical Models (v6.3) — the 6 manuscript models
+    "model_a": ("Numerical Models", 1),
+    "model_b": ("Numerical Models", 1),
+    "model_c": ("Numerical Models", 1),
+    "model_d": ("Numerical Models", 1),
+    "model_e": ("Numerical Models", 1),
+    "model_f": ("Numerical Models", 1),
+    # Tier 1: Geometry subtypes (v6.3.1) — manuscript-specific configurations
+    "boundary_layer": ("Structural Geometry", 1),
+    "alternating_layers": ("Structural Geometry", 1),
+    "central_layer": ("Structural Geometry", 1),
+}
+
+def get_hierarchy_label(concept_key: str,
+                        style: str = "arrow") -> str:
+    leaf = concept_key.replace("_", " ").title()
+    entry = _HIERARCHY_PARENTS.get(concept_key)
+    if entry is None or entry[0] is None or style == "leaf":
+        return leaf
+    parent_label = entry[0]
+    sep = " → " if style == "arrow" else " [" if style == "bracket" else " · "
+    if style == "bracket":
+        return f"{parent_label}{sep}{leaf}]"
+    return f"{parent_label}{sep}{leaf}"
+
+
+# ============================================================================
+# DENDRITE GROWTH KEYWORDS & PATTERNS
+# ============================================================================
+DENDRITE_KEYWORDS = [
+    "dendrite", "lithium", "electrolyte", "phase field", "order parameter",
+    "eta", "phi", "young's modulus", "poisson", "eigenstrain", "conductivity",
+    "solid-liquid ratio", "s/l ratio", "horizontal layering", "vertical stripe",
+    "random inclusion", "domain", "gradient energy", "free energy",
+    "butler-volmer", "overpotential", "concentration", "nucleation",
+    "von mises", "stress", "strain energy", "mechanical suppression",
+    "confinement", "llzo", "lipf6", "multiphysics", "finite element",
+    "dead lithium", "cycle life", "degradation", "dendrite length", "dendrite area"
+]
+
+DENDRITE_DESCRIPTOR_MAPPING = {
+    r'dendrite|growth|propagation': 'structural_geometry',
+    r'solid[\s-]?liquid[\s-]?ratio|s/?l\s+ratio|phase\s+fraction|volume\s+fraction': 'structural_geometry',
+    r'horizontal|layer|vertical|stripe|inclusion|random|configuration|geometry|arrangement|distribution|domain|confinement': 'structural_geometry',
+    r'order\s+parameter|eta|phi|young|modulus|poisson|conductivity|mobility|gradient\s+energy|interpolation|lithium\s+metal|llzo|lipf6|electrolyte|partition|phase[\s-]?field': 'phase_properties',
+    r'butler|volmer|overpotential|concentration|nucleation|chemical\s+free\s+energy|kinetics|ion|thermodynamic|equilibrium|dead\s+lithium|cycle\s+life|degradation': 'electrochemical_kinetics',
+    r'von\s+mises|stress|eigenstrain|strain\s+energy|elastic|mechanical\s+free\s+energy|suppression|finite\s+element|fea': 'mechanical_constraints',
+}
+
+DENDRITE_QUANTITATIVE_PATTERNS = [
+    r'\bdendrite\s+(?:length|area|growth)\b',
+    r'\b(?:s/?l\s+ratio|solid[\s-]?liquid\s+ratio|phase\s+fraction|volume\s+fraction)\b',
+    r'\b(?:horizontal\s+layering|vertical\s+stripe|random\s+inclusion)\b',
+    r'\bspatial\s+configuration\b',
+    r'\b(?:order\s+parameter|eta|phi)\b',
+    r'\byoung\w*\s+modulus\b',
+    r'\bpoisson\w*\s+ratio\b',
+    r'\beigenstrain\b',
+    r'\bionic\s+conductivity\b',
+    r'\bgradient\s+energy\s+coefficient\b',
+    r'\b(?:chemical|mechanical)\s+free\s+energy\b',
+    r'\belastic\s+strain\s+energy\b',
+    r'\bbutler[\s-]?volmer\b',
+    r'\boverpotential\b',
+    r'\bionic\s+concentration\b',
+    r'\bnucleation\s+perturbation\b',
+    r'\bvon\s+mises\s+stress\b',
+    r'\bmechanical\s+suppression\b',
+    r'\bgeometric\s+confinement\b',
+    r'\b(?:llzo|lipf6)\b',
+    r'\b(?:phase[\s-]?field|finite\s+element|fea)\b',
+    r'\b(?:dead\s+lithium|cycle\s+life|degradation)\b',
+    r'\bmultiphysics\s+coupling\b',
+]
+
+ALL_DENDRITE_KEYWORDS = DENDRITE_KEYWORDS
+
+
+def extract_dendrite_concepts_from_text(text: str) -> List[str]:
+    concepts = set()
+    text_lower = text.lower()
+    for pattern in DENDRITE_QUANTITATIVE_PATTERNS:
+        matches = re.findall(pattern, text, re.I)
+        for m in matches:
+            concept = m.lower().strip().rstrip('.').rstrip(',')
+            if len(concept.split()) >= 1 and len(concept) > 3:
+                concepts.add(concept)
+    for keyword in DENDRITE_KEYWORDS:
+        if keyword in text_lower:
+            concepts.add(keyword)
+    return list(concepts)
+
+def is_valid_dendrite_concept(concept: str) -> bool:
+    concept_lower = concept.lower()
+    has_domain = any(kw in concept_lower for kw in DENDRITE_KEYWORDS)
+    has_pattern = any(re.search(p, concept, re.I) for p in DENDRITE_QUANTITATIVE_PATTERNS)
+    generic = {'study', 'analysis', 'effect', 'role', 'investigation', 'research',
+               'method', 'approach', 'paper', 'work', 'using', 'based', 'novel',
+               'new', 'recent', 'various', 'different', 'significant', 'important'}
+    has_generic = any(term in concept_lower.split() for term in generic)
+    words = concept.split()
+    if len(words) < 2 or len(words) > 10:
+        return False
+    return (has_domain or has_pattern) and not has_generic
+
+def normalize_dendrite_concept(concept: str) -> str:
+    concept = concept.lower().strip()
+    concept = re.sub(r'\bsolid[\s-]?liquid\s+ratio\b', 'solid_liquid_ratio', concept)
+    concept = re.sub(r'\bs/?l\s+ratio\b', 'solid_liquid_ratio', concept)
+    concept = re.sub(r'\bphase\s+fraction\b', 'solid_liquid_ratio', concept)
+    concept = re.sub(r'\bvolume\s+fraction\b', 'solid_liquid_ratio', concept)
+    concept = re.sub(r'\bspatial\s+configuration\b', 'spatial_configuration', concept)
+    concept = re.sub(r'\bhorizontal\s+layering\b', 'horizontal_layering', concept)
+    concept = re.sub(r'\bvertical\s+stripe\b', 'vertical_stripes', concept)
+    concept = re.sub(r'\brandom\s+inclusion\b', 'random_inclusions', concept)
+    concept = re.sub(r'\bdomain\s+size\b', 'domain_size', concept)
+    concept = re.sub(r'\bsolid[\s-]?liquid\s+interface\b', 'solid_liquid_interface', concept)
+    concept = re.sub(r'\bgeometric\s+confinement\b', 'geometric_confinement', concept)
+    concept = re.sub(r'\border\s+parameter\s+eta\b', 'order_parameter_eta', concept)
+    concept = re.sub(r'\border\s+parameter\s+phi\b', 'order_parameter_phi', concept)
+    concept = re.sub(r'\byoung\w*\s+modulus\b', 'youngs_modulus', concept)
+    concept = re.sub(r'\bpoisson\w*\s+ratio\b', 'poissons_ratio', concept)
+    concept = re.sub(r'\beigenstrain\b', 'eigenstrain', concept)
+    concept = re.sub(r'\bionic\s+conductivity\b', 'ionic_conductivity', concept)
+    concept = re.sub(r'\bgradient\s+energy\s+coefficient\b', 'gradient_energy_coefficient', concept)
+    concept = re.sub(r'\bchemical\s+free\s+energy\b', 'chemical_free_energy', concept)
+    concept = re.sub(r'\bmechanical\s+free\s+energy\b', 'mechanical_free_energy', concept)
+    concept = re.sub(r'\belastic\s+strain\s+energy\b', 'elastic_strain_energy', concept)
+    concept = re.sub(r'\bbutler[\s-]?volmer\b', 'butler_volmer_kinetics', concept)
+    concept = re.sub(r'\boverpotential\b', 'overpotential', concept)
+    concept = re.sub(r'\bionic\s+concentration\b', 'ionic_concentration', concept)
+    concept = re.sub(r'\bnucleation\s+perturbation\b', 'nucleation_perturbation', concept)
+    concept = re.sub(r'\bvon\s+mises\s+stress\b', 'von_mises_stress', concept)
+    concept = re.sub(r'\bmechanical\s+suppression\b', 'mechanical_suppression', concept)
+    concept = re.sub(r'\bdendrite\s+length\b', 'dendrite_length', concept)
+    concept = re.sub(r'\bdendrite\s+area\b', 'dendrite_area', concept)
+    concept = re.sub(r'\bdendrite\s+growth\b', 'dendrite_growth', concept)
+    concept = re.sub(r'\bphase[\s-]?field\s+method\b', 'phase_field_method', concept)
+    concept = re.sub(r'\bmultiphysics\s+coupling\b', 'multiphysics_coupling', concept)
+    concept = re.sub(r'\bfinite\s+element\s+analysis\b', 'finite_element_analysis', concept)
+    concept = re.sub(r'\bdead\s+lithium\b', 'dead_lithium_formation', concept)
+    concept = re.sub(r'\bcycle\s+life\s+degradation\b', 'cycle_life_degradation', concept)
+    return concept
+
+
+def categorize_dendrite_concept(concept: str) -> str:
+    concept_lower = concept.lower()
+    for pattern, category in DENDRITE_DESCRIPTOR_MAPPING.items():
+        if re.search(pattern, concept_lower):
+            return category
+    return "general"
+
+def get_dendrite_category_color(concept: str, cmap_colors=None) -> str:
+    if cmap_colors:
+        return cmap_colors[hash(concept) % len(cmap_colors)]
+    cat = categorize_dendrite_concept(concept)
+    color_map = {
+        'structural_geometry': '#1f77b4',
+        'phase_properties': '#ff7f0e',
+        'electrochemical_kinetics': '#2ca02c',
+        'mechanical_constraints': '#d62728',
+        'general': '#c5b0d5',
+    }
+    return color_map.get(cat, '#7f7f7f')
+
+
+# ============================================================================
+# ADVANCED CONCEPT RESOLVER
+# ============================================================================
+class AdvancedConceptResolver:
+    def __init__(
+        self,
+        ontology: DomainOntology,
+        embed_model,
+        cache_max: int = 2000,
+    ) -> None:
+        self.ontology = ontology
+        self.embed_model = embed_model
+        self.resolution_cache: Dict[str, str] = {}
+        self.embedding_cache: Dict[str, np.ndarray] = {}
+        self._cache_max = max(100, int(cache_max))
+        self.similarity_threshold = 0.85
+        self.ontology_concepts_list: Optional[List[str]] = None
+        self.ontology_embedding_matrix: Optional[np.ndarray] = None
+        self._precompute_ontology_embeddings()
+
+    def _trim_embedding_cache(self) -> None:
+        if len(self.embedding_cache) > self._cache_max:
+            keys = list(self.embedding_cache.keys())
+            for k in keys[:int(len(keys) * 0.3)]:
+                del self.embedding_cache[k]
+            gc.collect()
+
+    def _trim_resolution_cache(self) -> None:
+        if len(self.resolution_cache) > self._cache_max * 4:
+            keys = list(self.resolution_cache.keys())
+            for k in keys[:int(len(keys) * 0.3)]:
+                del self.resolution_cache[k]
+
+    def _precompute_ontology_embeddings(self) -> None:
+        concepts: List[str] = []
+        all_texts: List[str] = []
+        text_counts: List[int] = []
+
+        for canonical, node in self.ontology.concepts.items():
+            concepts.append(canonical)
+            texts = [canonical] + list(node.synonyms)
+            all_texts.extend(texts)
+            text_counts.append(len(texts))
+
+        if not all_texts:
+            self.ontology_concepts_list = []
+            self.ontology_embedding_matrix = np.empty((0, 0))
+            return
+
+        with torch.no_grad():
+            all_embeddings = self.embed_model.encode(
+                all_texts,
+                show_progress_bar=False,
+                batch_size=64,
+                convert_to_numpy=True,
+            )
+
+        embeddings: List[np.ndarray] = []
+        idx = 0
+        for count in text_counts:
+            concept_embs = all_embeddings[idx:idx + count]
+            embeddings.append(np.mean(concept_embs, axis=0))
+            idx += count
+
+        del all_embeddings
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.ontology_concepts_list = concepts
+        self.ontology_embedding_matrix = (
+            np.array(embeddings) if embeddings else np.empty((0, 0))
+        )
+
+    @timed
+    def resolve(
+        self, text: str, context: str = "", use_embedding: bool = True
+    ) -> Optional[str]:
+        self._trim_resolution_cache()
+        text_lower = text.lower().strip()
+        if text_lower in self.resolution_cache:
+            return self.resolution_cache[text_lower]
+
+        canonical = self.ontology.resolve_concept(text)
+        if canonical:
+            self.resolution_cache[text_lower] = canonical
+            return canonical
+
+        canonical = self._substring_match(text_lower)
+        if canonical:
+            self.resolution_cache[text_lower] = canonical
+            return canonical
+
+        if use_embedding and self.ontology_embedding_matrix.size > 0:
+            canonical = self._embedding_match(text, context)
+            if canonical:
+                self.resolution_cache[text_lower] = canonical
+                return canonical
+
+        if context:
+            canonical = self._context_disambiguation(text_lower, context)
+            if canonical:
+                self.resolution_cache[text_lower] = canonical
+                return canonical
+
+        return None
+
+    @timed
+    def resolve_batch(
+        self, phrases: List[str], context: str = ""
+    ) -> Dict[str, Optional[str]]:
+        results: Dict[str, Optional[str]] = {}
+        need_embedding: List[str] = []
+
+        for phrase in phrases:
+            phrase_lower = phrase.lower().strip()
+            if phrase_lower in self.resolution_cache:
+                results[phrase] = self.resolution_cache[phrase_lower]
+                continue
+            canonical = self.ontology.resolve_concept(phrase)
+            if canonical:
+                self.resolution_cache[phrase_lower] = canonical
+                results[phrase] = canonical
+                continue
+            sub_match = self._substring_match(phrase_lower)
+            if sub_match:
+                self.resolution_cache[phrase_lower] = sub_match
+                results[phrase] = sub_match
+                continue
+            need_embedding.append(phrase)
+
+        if need_embedding and self.ontology_embedding_matrix.size > 0:
+            query_texts = [
+                p if not context else f"{p} in context of {context}"
+                for p in need_embedding
+            ]
+            with torch.no_grad():
+                query_embs = self.embed_model.encode(
+                    query_texts,
+                    show_progress_bar=False,
+                    batch_size=64,
+                    convert_to_numpy=True,
+                )
+            sims = cosine_similarity(query_embs, self.ontology_embedding_matrix)
+            best_indices = np.argmax(sims, axis=1)
+            best_scores = np.max(sims, axis=1)
+            for idx, phrase in enumerate(need_embedding):
+                if best_scores[idx] > self.similarity_threshold:
+                    canonical = self.ontology_concepts_list[best_indices[idx]]
+                    self.resolution_cache[phrase.lower().strip()] = canonical
+                    results[phrase] = canonical
+                else:
+                    results[phrase] = None
+            del query_embs, sims, best_indices, best_scores
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            for phrase in need_embedding:
+                results[phrase] = None
+
+        self._trim_resolution_cache()
+        return results
+
+    def _substring_match(self, text: str) -> Optional[str]:
+        for canonical, node in self.ontology.concepts.items():
+            all_forms = {canonical.lower()} | node.synonyms
+            for form in all_forms:
+                if form in text or text in form:
+                    if len(form) > 4 and len(text) > 4:
+                        return canonical
+        return None
+
+    def _embedding_match(self, text: str, context: str = "") -> Optional[str]:
+        try:
+            query_text = (
+                text if not context else f"{text} in context of {context}"
+            )
+            if query_text not in self.embedding_cache:
+                with torch.no_grad():
+                    self.embedding_cache[query_text] = self.embed_model.encode(
+                        query_text,
+                        show_progress_bar=False,
+                        convert_to_numpy=True,
+                    )
+            query_emb = self.embedding_cache[query_text]
+            sims = cosine_similarity(
+                [query_emb], self.ontology_embedding_matrix
+            )[0]
+            best_idx = int(np.argmax(sims))
+            if sims[best_idx] > self.similarity_threshold:
+                return self.ontology_concepts_list[best_idx]
+            return None
+        except Exception:
+            return None
+        finally:
+            self._trim_embedding_cache()
+
+    def _context_disambiguation(
+        self, text: str, context: str
+    ) -> Optional[str]:
+        context_lower = context.lower()
+        if 'eta' in text:
+            if 'overpotential' in context_lower or 'electrochem' in context_lower:
+                return 'overpotential'
+            return 'order_parameter_eta'
+        if 'phi' in text:
+            return 'order_parameter_phi'
+        if 'modulus' in text or "young" in text:
+            return 'youngs_modulus'
+        if 'llzo' in text or 'garnet' in text:
+            return 'llzo_solid_electrolyte'
+        if 'lipf6' in text or 'carbonate' in text:
+            return 'lipf6_liquid_electrolyte'
+        if 's/l' in text or 'solid-liquid ratio' in text:
+            return 'solid_liquid_ratio'
+        return None
+
+
+# ============================================================================
+# ENHANCED CONCEPT EXTRACTOR (Dendrite-growth domain)
+# ============================================================================
+class EnhancedConceptExtractor:
+    def __init__(
+        self,
+        ontology: DomainOntology,
+        resolver: AdvancedConceptResolver,
+        store_contexts: bool = False,
+        store_documents: bool = True,
+    ) -> None:
+        self.ontology = ontology
+        self.resolver = resolver
+        self.concept_frequencies: Dict[str, int] = defaultdict(int)
+        self.store_contexts = store_contexts
+        self.store_documents = store_documents
+        self.concept_contexts: Dict[str, List[str]] = defaultdict(list)
+        self.document_concepts: Dict[int, List[str]] = defaultdict(list)
+        self._build_extraction_patterns()
+        all_keywords = self._get_all_keywords()
+        if all_keywords:
+            sorted_keywords = sorted(all_keywords, key=len, reverse=True)[:500]
+            pattern = r'\b(' + '|'.join(
+                re.escape(k) for k in sorted_keywords
+            ) + r')\b'
+            self._keyword_regex = re.compile(pattern, re.IGNORECASE)
+        else:
+            self._keyword_regex = None
+
+    def _build_extraction_patterns(self) -> None:
+        self.dendrite_patterns = [
+            r'\bdendrite\s+(?:length|area|growth|tip|propagation)\b',
+            r'\b(?:s/?l\s+ratio|solid[\s-]?liquid\s+ratio|phase\s+fraction|volume\s+fraction)\b',
+            r'\b(?:horizontal\s+layer|vertical\s+stripe|random\s+inclusion)\w*\b',
+            r'\bspatial\s+configuration\b',
+            r'\border\s+parameter\s+(?:eta|phi)\b',
+            r'\b(?:young|poisson)\w*\s+(?:modulus|ratio)\b',
+            r'\beigenstrain\b',
+            r'\bionic\s+(?:conductivity|concentration)\b',
+            r'\bgradient\s+energy\s+coefficient\b',
+            r'\b(?:chemical|mechanical)\s+free\s+energy\b',
+            r'\belastic\s+strain\s+energy\b',
+            r'\bbutler[\s-]?volmer\b',
+            r'\boverpotential\b',
+            r'\bnucleation\s+perturbation\b',
+            r'\bvon\s+mises\s+stress\b',
+            r'\bmechanical\s+suppression\b',
+            r'\bgeometric\s+confinement\b',
+            r'\bsolid[\s-]?liquid\s+interface\b',
+            r'\b(?:llzo|lipf6)\b',
+            r'\b(?:lithium\s+metal|liquid\s+electrolyte|solid\s+(?:electrolyte|partition))\b',
+            r'\b(?:phase[\s-]?field|finite\s+element|fea)\b',
+            r'\b(?:dead\s+lithium|cycle\s+life)\b',
+            r'\bmultiphysics\s+coupling\b',
+            r'\bthermodynamic\s+equilibrium\b',
+        ]
+        self.compiled_patterns = [
+            re.compile(p, re.IGNORECASE) for p in self.dendrite_patterns
+        ]
+        self.cause_effect_patterns = [
+            r'\b(increase|decrease|enhance|reduce)\w*\s+(?:in|of)\s+([\w\s-]+?)\s+(?:lead[s]?|result[s]?|cause[s]?)\s+(?:to|in)?\s+([\w\s-]+?)\b',
+        ]
+        self.compiled_cause_patterns = [
+            re.compile(p, re.IGNORECASE) for p in self.cause_effect_patterns
+        ]
+
+    @timed
+    def extract_from_text(self, text: str, doc_id: int = 0, allowed_concepts: Optional[Set[str]] = None) -> List[str]:
+        concepts: Set[str] = set()
+        text_lower = text.lower()
+
+        for pattern in self.compiled_patterns:
+            matches = pattern.findall(text)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = (
+                        match[0] if match[0]
+                        else (match[1] if len(match) > 1 else match[0])
+                    )
+                concept = match.lower().strip()
+                if len(concept) > 3:
+                    canonical = self.resolver.resolve(concept, context=text[:200])
+                    if canonical:
+                        if allowed_concepts is not None and canonical not in allowed_concepts:
+                            continue
+                        concepts.add(canonical)
+                    else:
+                        if allowed_concepts is not None:
+                            continue
+                        concepts.add(concept)
+
+        context_concepts = self._extract_from_context_windows(text)
+        if allowed_concepts is not None:
+            context_concepts = {c for c in context_concepts if c in allowed_concepts}
+        concepts.update(context_concepts)
+
+        raw_concepts = set()
+        for c in concepts:
+            if c not in self.ontology.concepts and not self.resolver.resolve(c):
+                raw_concepts.add(c)
+        if raw_concepts:
+            raw_list = list(raw_concepts)[:50]
+            resolved_map = self.resolver.resolve_batch(raw_list, context="")
+            for raw, canonical in resolved_map.items():
+                if canonical:
+                    if allowed_concepts is not None and canonical not in allowed_concepts:
+                        continue
+                    concepts.add(canonical)
+                else:
+                    if allowed_concepts is not None:
+                        continue
+                    concepts.add(raw)
+
+        for concept in concepts:
+            self.concept_frequencies[concept] += 1
+            if self.store_contexts:
+                self.concept_contexts[concept].append(text[:200])
+        if self.store_documents:
+            self.document_concepts[doc_id] = list(concepts)
+        return list(concepts)
+
+    def _extract_from_context_windows(
+        self, text: str, window_size: int = 100
+    ) -> Set[str]:
+        if not self._keyword_regex:
+            return set()
+        candidate_phrases: Set[str] = set()
+        text_lower = text.lower()
+        match_count = 0
+        for match in self._keyword_regex.finditer(text_lower):
+            if match_count > 20:
+                break
+            match_count += 1
+            start = max(0, match.start() - window_size)
+            end = min(len(text), match.end() + window_size)
+            local_context = text_lower[start:end]
+            phrases = re.findall(
+                r'\b([a-z]+(?:[-\s][a-z]+){1,3})\b', local_context
+            )
+            for phrase in phrases:
+                if 5 <= len(phrase) <= 40:
+                    canonical = self.resolver.resolve(phrase, context=local_context)
+                    if canonical:
+                        candidate_phrases.add(canonical)
+        return candidate_phrases
+
+    def _get_all_keywords(self) -> Set[str]:
+        keywords: Set[str] = set()
+        for canonical, node in self.ontology.concepts.items():
+            keywords.add(canonical)
+            keywords.update(node.synonyms)
+        return keywords
+
+    def extract_relationships(self, text: str) -> List[Relationship]:
+        relationships: List[Relationship] = []
+        for pattern in self.compiled_cause_patterns:
+            matches = pattern.findall(text)
+            for match in matches:
+                if len(match) >= 2:
+                    source = (
+                        match[0] if isinstance(match[0], str) else match[1]
+                    )
+                    target = (
+                        match[-1] if isinstance(match[-1], str) else match[0]
+                    )
+                    source_canon = self.resolver.resolve(source, context=text[:200])
+                    target_canon = self.resolver.resolve(target, context=text[:200])
+                    if (
+                        source_canon and target_canon
+                        and source_canon != target_canon
+                    ):
+                        rel = Relationship(
+                            source=source_canon,
+                            target=target_canon,
+                            rel_type=RelationshipType.CAUSES,
+                            confidence=0.7,
+                            evidence=text[:150],
+                        )
+                        relationships.append(rel)
+        return relationships
+
+    def get_concept_frequencies(self) -> Dict[str, int]:
+        return dict(self.concept_frequencies)
+
+
+# ============================================================================
+# REASONING-ENHANCED GRAPH BUILDER
+# ============================================================================
+class ReasoningEnhancedGraphBuilder:
+    def __init__(
+        self, ontology: DomainOntology, extractor: EnhancedConceptExtractor
+    ) -> None:
+        self.ontology = ontology
+        self.extractor = extractor
+        self.reasoning_paths: List[List[str]] = []
+        self.inferred_edges: Set[Tuple[str, str]] = set()
+
+    @timed
+    def build_graph(
+        self,
+        all_concepts: List[List[str]],
+        valid_concepts: List[str],
+        concept_to_id: Dict[str, int],
+        embed_model=None,
+        config: Dict = None,
+    ) -> nx.Graph:
+        if config is None:
+            config = get_adaptive_config(3000)
+        nx_graph = nx.Graph()
+
+        for c in valid_concepts:
+            concept_type = self.ontology.get_concept_type(c)
+            freq = self.extractor.concept_frequencies.get(c, 0)
+            definition = self.ontology.get_definition(c)
+            nx_graph.add_node(
+                c,
+                frequency=freq,
+                concept_type=concept_type.value,
+                definition=definition,
+                degree=0,
+            )
+
+        cooccurrence_map: Dict[Tuple[str, str], int] = defaultdict(int)
+        for concepts in all_concepts:
+            valid_in_doc = [c for c in concepts if c in concept_to_id]
+            for i in range(len(valid_in_doc)):
+                for j in range(i + 1, len(valid_in_doc)):
+                    u, v = valid_in_doc[i], valid_in_doc[j]
+                    if u != v:
+                        key = tuple(sorted([u, v]))
+                        cooccurrence_map[key] += 1
+
+        for (u, v), count in cooccurrence_map.items():
+            nx_graph.add_edge(
+                u, v,
+                weight=count,
+                cooccurrence=count,
+                semantic=0,
+                edge_type='cooccurrence',
+                inferred=False,
+            )
+
+        if embed_model and len(valid_concepts) >= 10:
+            self._add_semantic_edges(nx_graph, valid_concepts, embed_model, config)
+
+        if st.session_state.get('use_inference', True):
+            self._add_inferred_edges(nx_graph, valid_concepts)
+            self._add_cause_effect_edges(nx_graph)
+            self._add_hierarchical_edges(nx_graph, valid_concepts)
+
+        self._compute_final_weights(nx_graph, config)
+        return nx_graph
+
+    def _add_semantic_edges(
+        self, nx_graph: nx.Graph, valid_concepts: List[str],
+        embed_model, config: Dict,
+    ) -> None:
+        try:
+            with torch.no_grad():
+                embeddings = embed_model.encode(
+                    valid_concepts,
+                    show_progress_bar=False,
+                    batch_size=64,
+                    convert_to_numpy=True,
+                )
+            sim_matrix = cosine_similarity(embeddings)
+            sim_thresh = config.get("SIMILARITY_THRESHOLD", 0.85)
+            for i, c1 in enumerate(valid_concepts):
+                for j, c2 in enumerate(valid_concepts[i + 1:], start=i + 1):
+                    if c1 == c2 or nx_graph.has_edge(c1, c2):
+                        continue
+                    sim = sim_matrix[i][j]
+                    if sim > sim_thresh:
+                        if nx_graph.degree(c1) < 3 or nx_graph.degree(c2) < 3:
+                            nx_graph.add_edge(
+                                c1, c2,
+                                weight=sim * 2,
+                                cooccurrence=0,
+                                semantic=sim,
+                                edge_type='semantic',
+                                inferred=False,
+                            )
+            del embeddings, sim_matrix
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            st.warning(f"Semantic edge addition skipped: {e}")
+
+    def _add_inferred_edges(
+        self, nx_graph: nx.Graph, valid_concepts: List[str]
+    ) -> None:
+        for rel in self.ontology.relationships:
+            if rel.source in valid_concepts and rel.target in valid_concepts:
+                if not nx_graph.has_edge(rel.source, rel.target):
+                    nx_graph.add_edge(
+                        rel.source, rel.target,
+                        weight=rel.confidence * 2,
+                        cooccurrence=0,
+                        semantic=rel.confidence,
+                        edge_type=rel.rel_type.value,
+                        inferred=True,
+                        confidence=rel.confidence,
+                    )
+                    self.inferred_edges.add((rel.source, rel.target))
+        self._infer_cross_domain_bridges(nx_graph, valid_concepts)
+
+    def _infer_cross_domain_bridges(
+        self, nx_graph: nx.Graph, valid_concepts: List[str]
+    ) -> None:
+        method_nodes = [
+            c for c in valid_concepts
+            if self.ontology.get_concept_type(c) == ConceptType.METHOD
+        ]
+        property_nodes = [
+            c for c in valid_concepts
+            if self.ontology.get_concept_type(c) == ConceptType.PROPERTY
+        ]
+        for method in method_nodes:
+            for prop in property_nodes:
+                if not nx_graph.has_edge(method, prop):
+                    paths = self.ontology.infer_path(method, prop, max_depth=2)
+                    if paths:
+                        avg_confidence = 0.6
+                        nx_graph.add_edge(
+                            method, prop,
+                            weight=avg_confidence,
+                            cooccurrence=0,
+                            semantic=avg_confidence,
+                            edge_type='bridge',
+                            inferred=True,
+                            path=" -> ".join(paths[0]),
+                        )
+                        self.inferred_edges.add((method, prop))
+                        self.reasoning_paths.append(paths[0])
+
+    def _add_cause_effect_edges(self, nx_graph: nx.Graph) -> None:
+        pass
+
+    def _add_hierarchical_edges(
+        self, nx_graph: nx.Graph, valid_concepts: List[str]
+    ) -> None:
+        for concept in valid_concepts:
+            if concept not in self.ontology.concepts:
+                continue
+            node = self.ontology.concepts[concept]
+            for hypernym in node.hypernyms:
+                if (
+                    hypernym in valid_concepts
+                    and not nx_graph.has_edge(concept, hypernym)
+                ):
+                    nx_graph.add_edge(
+                        concept, hypernym,
+                        weight=1.0, cooccurrence=0, semantic=0.95,
+                        edge_type='hypernym', inferred=True,
+                    )
+            for hyponym in node.hyponyms:
+                if (
+                    hyponym in valid_concepts
+                    and not nx_graph.has_edge(concept, hyponym)
+                ):
+                    nx_graph.add_edge(
+                        concept, hyponym,
+                        weight=1.0, cooccurrence=0, semantic=0.95,
+                        edge_type='hyponym', inferred=True,
+                    )
+
+    def _compute_final_weights(
+        self, nx_graph: nx.Graph, config: Dict
+    ) -> None:
+        cooc_weight = config.get("COOCCURRENCE_WEIGHT", 0.7)
+        sem_weight = config.get("SEMANTIC_WEIGHT", 0.2)
+        inf_weight = config.get("INFERENCE_WEIGHT", 0.1)
+        for u, v, data in nx_graph.edges(data=True):
+            cooc = data.get('cooccurrence', 0)
+            sem = data.get('semantic', 0)
+            inf = 1.0 if data.get('inferred', False) else 0
+            conf = data.get('confidence', 0.5)
+            data['weight'] = (
+                cooc_weight * cooc
+                + sem_weight * sem
+                + inf_weight * inf * conf
+            )
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+def compute_text_hash(text: str) -> str:
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
+def get_adaptive_config(num_abstracts: int) -> Dict[str, Any]:
+    if num_abstracts <= 50:
+        return {
+            "MIN_CONCEPT_FREQ": 2, "MIN_CONCEPT_LENGTH_WORDS": 2,
+            "MIN_DEGREE": 1, "USE_SEMANTIC_CLUSTERING": True,
+            "SIMILARITY_THRESHOLD": 0.72, "COOCCURRENCE_WEIGHT": 0.5,
+            "SEMANTIC_WEIGHT": 0.5, "CLUSTER_SIMILARITY": 0.75,
+            "TOP_N_CONCEPTS": 200, "MAX_CONCEPT_LENGTH": 6,
+            "INFERENCE_WEIGHT": 0.1,
+        }
+    elif num_abstracts <= 500:
+        return {
+            "MIN_CONCEPT_FREQ": 3, "MIN_CONCEPT_LENGTH_WORDS": 2,
+            "MIN_DEGREE": 2, "USE_SEMANTIC_CLUSTERING": True,
+            "SIMILARITY_THRESHOLD": 0.78, "COOCCURRENCE_WEIGHT": 0.6,
+            "SEMANTIC_WEIGHT": 0.3, "CLUSTER_SIMILARITY": 0.72,
+            "TOP_N_CONCEPTS": 500, "MAX_CONCEPT_LENGTH": 8,
+            "INFERENCE_WEIGHT": 0.1,
+        }
+    else:
+        return {
+            "MIN_CONCEPT_FREQ": 5, "MIN_CONCEPT_LENGTH_WORDS": 2,
+            "MIN_DEGREE": 3, "USE_SEMANTIC_CLUSTERING": False,
+            "SIMILARITY_THRESHOLD": 0.85, "COOCCURRENCE_WEIGHT": 0.7,
+            "SEMANTIC_WEIGHT": 0.2, "CLUSTER_SIMILARITY": 0.68,
+            "TOP_N_CONCEPTS": 1000, "MAX_CONCEPT_LENGTH": 10,
+            "INFERENCE_WEIGHT": 0.1,
+        }
+
+
+@st.cache_resource(show_spinner=False)
+def load_embedding_model():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        return SentenceTransformer(
+            "sentence-transformers/all-MiniLM-L6-v2", device=device
+        )
+    except Exception as e:
+        st.error(f"Embedding model error: {e}")
+        return SentenceTransformer(
+            "sentence-transformers/all-MiniLM-L6-v2", device="cpu"
+        )
+
+
+# ============================================================================
+# CONCEPT DISTILLATION (Memory-safe)
+# ============================================================================
+def compute_concept_distillation(
+    valid_concepts: List[str],
+    concept_abstract_map: Dict[str, List[int]],
+    all_texts: Union[List[str], Dict[int, str]],
+    max_docs_per_concept: int = 30,
+) -> pd.DataFrame:
+    distill_data: List[Dict[str, Any]] = []
+    doc_corpus: List[str] = []
+
+    texts_is_dict = isinstance(all_texts, dict)
+    n_texts = len(all_texts)
+
+    for c in valid_concepts:
+        doc_indices = concept_abstract_map.get(c, [])
+        if max_docs_per_concept and len(doc_indices) > max_docs_per_concept:
+            doc_indices = doc_indices[:max_docs_per_concept]
+        if texts_is_dict:
+            doc_text = " ".join([
+                all_texts[i] for i in doc_indices
+                if i in all_texts
+            ])
+        else:
+            doc_text = " ".join([
+                all_texts[i] for i in doc_indices
+                if isinstance(i, int) and 0 <= i < n_texts
+            ])
+        doc_corpus.append(doc_text)
+
+    tfidf = TfidfVectorizer(
+        analyzer='word', ngram_range=(1, 2),
+        stop_words='english', max_features=2000,
+    )
+    try:
+        if any(doc_corpus) and any(t.strip() for t in doc_corpus):
+            tfidf_matrix = tfidf.fit_transform(doc_corpus)
+            tfidf_scores = tfidf_matrix.max(axis=1).A1
+            del tfidf_matrix
+        else:
+            tfidf_scores = np.ones(len(valid_concepts))
+    except Exception:
+        tfidf_scores = np.ones(len(valid_concepts))
+    gc.collect()
+
+    embed_model = load_embedding_model()
+
+    for i, c in enumerate(valid_concepts):
+        freq = len(concept_abstract_map.get(c, []))
+        semantic_density = float(tfidf_scores[i])
+        coherence = 0.0
+        if freq > 1 and doc_corpus[i].strip():
+            try:
+                words = doc_corpus[i].split()[:20]
+                with torch.no_grad():
+                    concept_embeddings = embed_model.encode(
+                        words, show_progress_bar=False,
+                        batch_size=16, convert_to_numpy=True,
+                    )
+                if len(concept_embeddings) > 1:
+                    sim_matrix = cosine_similarity(concept_embeddings)
+                    coherence = float(np.mean(
+                        sim_matrix[np.triu_indices_from(sim_matrix, k=1)]
+                    ))
+                    del sim_matrix
+                del concept_embeddings, words
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                coherence = 0.0
+        distill_data.append({
+            "concept": c,
+            "frequency": freq,
+            "tfidf_weight": semantic_density,
+            "semantic_density": semantic_density,
+            "coherence_score": float(coherence),
+            "distillation_efficiency": float(
+                semantic_density * np.log1p(freq) * (0.5 + 0.5 * coherence)
+            ),
+        })
+
+    del doc_corpus
+    gc.collect()
+    return pd.DataFrame(distill_data).sort_values(
+        "distillation_efficiency", ascending=False
+    )
+
+
+# ============================================================================
+# LEGACY GRAPH CONSTRUCTION (FALLBACK)
+# ============================================================================
+def build_hybrid_graph(
+    all_concepts: List[List[str]],
+    valid_concepts: List[str],
+    concept_to_id: Dict[str, int],
+    embed_model=None,
+    config: Dict = None,
+    ontology: DomainOntology = None,
+) -> nx.Graph:
+    if config is None:
+        config = get_adaptive_config(3000)
+    nx_graph = nx.Graph()
+    for c in valid_concepts:
+        concept_type = ontology.get_concept_type(c).value if ontology else 'general'
+        definition = ontology.get_definition(c) if ontology else ''
+        nx_graph.add_node(
+            c, frequency=0, concept_type=concept_type, definition=definition,
+        )
+    for concepts in all_concepts:
+        valid_in_doc = [c for c in concepts if c in concept_to_id]
+        for i in range(len(valid_in_doc)):
+            for j in range(i + 1, len(valid_in_doc)):
+                u, v = valid_in_doc[i], valid_in_doc[j]
+                if nx_graph.has_edge(u, v):
+                    nx_graph[u][v]['weight'] += 1
+                    nx_graph[u][v]['cooccurrence'] += 1
+                else:
+                    nx_graph.add_edge(
+                        u, v, weight=1, cooccurrence=1, semantic=0,
+                        edge_type='cooccurrence',
+                    )
+                nx_graph.nodes[u]['frequency'] = (
+                    nx_graph.nodes[u].get('frequency', 0) + 1
+                )
+                nx_graph.nodes[v]['frequency'] = (
+                    nx_graph.nodes[v].get('frequency', 0) + 1
+                )
+    if embed_model and len(valid_concepts) >= 10:
+        try:
+            with torch.no_grad():
+                embeddings = embed_model.encode(
+                    valid_concepts, show_progress_bar=False,
+                    batch_size=64, convert_to_numpy=True,
+                )
+            sim_matrix = cosine_similarity(embeddings)
+            sim_thresh = config.get("SIMILARITY_THRESHOLD", 0.85)
+            for i, c1 in enumerate(valid_concepts):
+                for j, c2 in enumerate(valid_concepts[i + 1:], start=i + 1):
+                    if c1 == c2 or nx_graph.has_edge(c1, c2):
+                        continue
+                    sim = sim_matrix[i][j]
+                    if sim > sim_thresh and (
+                        nx_graph.degree(c1) < 3 or nx_graph.degree(c2) < 3
+                    ):
+                        nx_graph.add_edge(
+                            c1, c2, weight=sim * 2, cooccurrence=0,
+                            semantic=sim, edge_type='semantic',
+                        )
+            del embeddings, sim_matrix
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            st.warning(f"Semantic edge addition skipped: {e}")
+    cooc_weight = config.get("COOCCURRENCE_WEIGHT", 0.9)
+    sem_weight = config.get("SEMANTIC_WEIGHT", 0.1)
+    for u, v, data in nx_graph.edges(data=True):
+        cooc = data.get('cooccurrence', 0)
+        sem = data.get('semantic', 0)
+        data['weight'] = cooc_weight * cooc + sem_weight * sem
+    return nx_graph
+
+
+def sample_edges_for_training(
+    nx_graph: nx.Graph,
+    valid_concepts: List[str],
+    concept_to_id: Dict[str, int],
+    config: Dict = None,
+    memory_safe: bool = False,
+) -> Tuple[List[Tuple], List[Tuple]]:
+    pos_pairs = [(concept_to_id[u], concept_to_id[v]) for u, v in nx_graph.edges()]
+    neg_pairs: List[Tuple[int, int]] = []
+    n_nodes = len(valid_concepts)
+    if n_nodes < 3:
+        return pos_pairs, neg_pairs
+    if memory_safe:
+        target_negs = min(len(pos_pairs) * 2 if pos_pairs else 30, 2000)
+    else:
+        target_negs = min(len(pos_pairs) * 3 if pos_pairs else 30, 5000)
+    attempts = 0
+    max_attempts = 50000
+    if memory_safe:
+        path_lengths = {}
+    else:
+        try:
+            path_lengths = dict(nx.all_pairs_shortest_path_length(nx_graph, cutoff=3))
+        except Exception:
+            path_lengths = {}
+    while len(neg_pairs) < target_negs and attempts < max_attempts:
+        u_idx, v_idx = np.random.choice(n_nodes, 2, replace=False)
+        u_c, v_c = valid_concepts[u_idx], valid_concepts[v_idx]
+        if nx_graph.has_edge(u_c, v_c):
+            attempts += 1
+            continue
+        dist = path_lengths.get(u_c, {}).get(v_c, 999)
+        if dist == 2 or dist == 3:
+            neg_pairs.append((int(u_idx), int(v_idx)))
+        elif dist == 999 and np.random.rand() < 0.1:
+            neg_pairs.append((int(u_idx), int(v_idx)))
+        attempts += 1
+    while len(neg_pairs) < target_negs:
+        u_idx, v_idx = np.random.choice(n_nodes, 2, replace=False)
+        if not nx_graph.has_edge(valid_concepts[u_idx], valid_concepts[v_idx]):
+            neg_pairs.append((int(u_idx), int(v_idx)))
+    return pos_pairs, neg_pairs
+
+
+# ============================================================================
+# GNN MODEL
+# ============================================================================
+class SparseGraphSAGE(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.lin1 = nn.Linear(in_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self, adj_indices, adj_values, num_nodes, h,
+        pos_u, pos_v, neg_u, neg_v,
+    ):
+        A = sparse.FloatTensor(
+            adj_indices, adj_values, torch.Size([num_nodes, num_nodes])
+        ).to(h.device)
+        deg = torch.sparse.sum(A, dim=1).to_dense().clamp(min=1)
+        deg_inv = 1.0 / deg
+        h1 = F.relu(
+            self.lin1(torch.sparse.mm(A, h) * deg_inv.unsqueeze(1))
+        )
+        h2 = self.lin2(torch.sparse.mm(A, h1) * deg_inv.unsqueeze(1))
+        pos_scores = self.decoder(
+            torch.cat([h2[pos_u], h2[pos_v]], dim=1)
+        ).squeeze(1)
+        neg_scores = self.decoder(
+            torch.cat([h2[neg_u], h2[neg_v]], dim=1)
+        ).squeeze(1)
+        return pos_scores, neg_scores, h2
+
+
+# ============================================================================
+# MICROTRANSFORMER #2: LatentMoE KG‑RAG EXTRACTOR
+# ============================================================================
+class LatentMoEKGExtractor(nn.Module):
+    def __init__(self, num_nodes, num_edge_types, d_model=96, latent_dim=24,
+                 n_experts=32, top_k=4, num_heads=4, num_layers=2):
+        super().__init__()
+        self.node_embedding = nn.Embedding(num_nodes, d_model)
+        self.edge_embedding = nn.Embedding(num_edge_types, d_model)
+
+        self.down_proj = nn.Linear(d_model, latent_dim, bias=False)
+        self.up_proj = nn.Linear(latent_dim, d_model, bias=False)
+
+        self.router = nn.Linear(latent_dim, n_experts)
+        self.experts = nn.ModuleList([nn.Linear(latent_dim, latent_dim) for _ in range(n_experts)])
+        self.top_k = top_k
+        self.n_experts = n_experts
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=num_heads, batch_first=True,
+            dim_feedforward=d_model * 2, dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, node_seq, edge_seq, router_prior=None):
+        node_emb = self.node_embedding(node_seq)
+        if edge_seq.size(1) > 0:
+            edge_emb = self.edge_embedding(edge_seq)
+            node_emb[:, 1:, :] = node_emb[:, 1:, :] + edge_emb
+
+        batch_size, seq_len, d_model = node_emb.shape
+        latent_repr = self.down_proj(node_emb)
+
+        flat_latent = latent_repr.view(batch_size * seq_len, -1)
+        router_logits = self.router(flat_latent)
+        if router_prior is not None:
+            router_logits = router_logits + router_prior.to(router_logits.device)
+        routing_weights = F.softmax(router_logits, dim=-1)
+        topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-6)
+
+        expert_outputs = torch.stack([self.experts[i](flat_latent) for i in range(self.n_experts)], dim=0)
+        token_indices = torch.arange(batch_size * seq_len, device=flat_latent.device).unsqueeze(1).expand(-1, self.top_k)
+        selected = expert_outputs[topk_indices, token_indices, :]
+        weighted = topk_weights.unsqueeze(-1) * selected
+        moe_output_flat = weighted.sum(dim=1)
+
+        moe_output = moe_output_flat.view(batch_size, seq_len, -1)
+        node_emb = node_emb + self.up_proj(moe_output)
+        out = self.transformer(node_emb)
+        out = self.output_proj(out)
+        return out, routing_weights.view(batch_size, seq_len, -1)
+
+
+def train_gnn(
+    node_features, nx_graph, concept_to_id, pos_pairs, neg_pairs,
+    progress_callback=None, epochs: int = 50, lr: float = 1e-3,
+):
+    num_nodes = len(concept_to_id)
+    in_dim = node_features.shape[1] if node_features.numel() > 0 else 384
+    if not pos_pairs:
+        nodes = list(concept_to_id.values())
+        if len(nodes) >= 2:
+            pos_pairs = [(nodes[0], nodes[1])]
+        else:
+            raise ValueError("Cannot train GNN with fewer than 2 concepts")
+    unique_edges = {(min(u, v), max(u, v)) for u, v in pos_pairs}
+    src_adj = torch.tensor([u for u, v in unique_edges], dtype=torch.long)
+    dst_adj = torch.tensor([v for u, v in unique_edges], dtype=torch.long)
+    adj_indices = torch.stack([src_adj, dst_adj], dim=0)
+    adj_values = torch.ones(adj_indices.shape[1], dtype=torch.float32)
+    target_device = (
+        node_features.device if node_features.numel() > 0
+        else torch.device('cpu')
+    )
+    pos_u = torch.tensor(
+        [p[0] for p in pos_pairs], dtype=torch.long, device=target_device
+    )
+    pos_v = torch.tensor(
+        [p[1] for p in pos_pairs], dtype=torch.long, device=target_device
+    )
+    neg_u = (
+        torch.tensor(
+            [n[0] for n in neg_pairs], dtype=torch.long, device=target_device
+        )
+        if neg_pairs
+        else torch.tensor([], dtype=torch.long, device=target_device)
+    )
+    neg_v = (
+        torch.tensor(
+            [n[1] for n in neg_pairs], dtype=torch.long, device=target_device
+        )
+        if neg_pairs
+        else torch.tensor([], dtype=torch.long, device=target_device)
+    )
+    model = SparseGraphSAGE(in_dim=in_dim, hidden_dim=128).to(target_device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        if len(neg_pairs) == 0:
+            pos_out, _, _ = model(
+                adj_indices, adj_values, num_nodes, node_features,
+                pos_u, pos_v, pos_u[:1], pos_v[:1],
+            )
+            loss = criterion(pos_out, torch.ones_like(pos_out)) * 0.5
+        else:
+            pos_out, neg_out, _ = model(
+                adj_indices, adj_values, num_nodes, node_features,
+                pos_u, pos_v, neg_u, neg_v,
+            )
+            pos_loss = criterion(pos_out, torch.ones_like(pos_out))
+            neg_loss = criterion(neg_out, torch.zeros_like(neg_out))
+            loss = 0.5 * (pos_loss + neg_loss)
+        loss.backward()
+        optimizer.step()
+        if progress_callback and epoch % 10 == 0:
+            progress_callback(epoch, loss.item())
+    model.eval()
+    with torch.no_grad():
+        _, _, final_embeddings = model(
+            adj_indices, adj_values, num_nodes, node_features,
+            pos_u[:1], pos_v[:1],
+            neg_u[:1] if len(neg_pairs) > 0 else pos_u[:1],
+            neg_v[:1] if len(neg_pairs) > 0 else pos_v[:1],
+        )
+    return model, final_embeddings.cpu(), adj_indices.cpu(), adj_values.cpu()
+
+
+# ============================================================================
+# RESEARCH DIRECTION SCORING
+# ============================================================================
+def compute_research_direction_scores(
+    model, node_features, final_emb, nx_graph,
+    valid_concepts, concept_properties, ridge,
+    embed_model, n_samples: int = 5000,
+) -> pd.DataFrame:
+    n_concepts = len(valid_concepts)
+    if n_concepts < 3:
+        return pd.DataFrame()
+    u_ids = np.random.randint(
+        n_concepts, size=min(n_samples, n_concepts * 5)
+    )
+    v_ids = np.random.randint(
+        n_concepts, size=min(n_samples, n_concepts * 5)
+    )
+    candidate_pairs: List[Tuple[int, int, str, str]] = []
+    for u_idx, v_idx in zip(u_ids, v_ids):
+        if u_idx == v_idx:
+            continue
+        u_c, v_c = valid_concepts[u_idx], valid_concepts[v_idx]
+        if nx_graph.has_edge(u_c, v_c):
+            continue
+        candidate_pairs.append((int(u_idx), int(v_idx), u_c, v_c))
+    if not candidate_pairs:
+        return pd.DataFrame()
+    u_tensor = torch.tensor([p[0] for p in candidate_pairs], dtype=torch.long)
+    v_tensor = torch.tensor([p[1] for p in candidate_pairs], dtype=torch.long)
+    model.eval()
+    with torch.no_grad():
+        pair_features = torch.cat(
+            [final_emb[u_tensor], final_emb[v_tensor]], dim=1
+        )
+        gnn_logits = model.decoder(pair_features).squeeze(1)
+        gnn_scores = torch.sigmoid(gnn_logits).numpy()
+    with torch.no_grad():
+        emb_np = embed_model.encode(
+            valid_concepts, show_progress_bar=False,
+            batch_size=64, convert_to_numpy=True,
+        )
+    cos_sims = np.sum(
+        emb_np[u_tensor.numpy()] * emb_np[v_tensor.numpy()], axis=1
+    )
+    results: List[Dict[str, Any]] = []
+    for i, (u_idx, v_idx, u_c, v_c) in enumerate(candidate_pairs):
+        p_u = concept_properties.get(u_c, 0)
+        p_v = concept_properties.get(v_c, 0)
+        expected_improvement = 0
+        if ridge is not None and (p_u > 0 or p_v > 0):
+            try:
+                expected_improvement = float(
+                    ridge.predict([[p_u, p_v, 1.0]])[0]
+                )
+            except Exception:
+                expected_improvement = max(p_u, p_v) * 1.05
+        semantic_novelty = 1.0 - cos_sims[i]
+        feasibility = (
+            np.exp(-0.5 * semantic_novelty)
+            * (1.0 if (p_u > 0 or p_v > 0) else 0.6)
+        )
+        alpha = {'gnn': 0.4, 'novelty': 0.3, 'gain': 0.2, 'feas': -0.1}
+        norm_gain = (
+            np.clip((expected_improvement - 50) / 200, 0, 1)
+            if expected_improvement > 0 else 0
+        )
+        D_uv = (
+            alpha['gnn'] * gnn_scores[i]
+            + alpha['novelty'] * semantic_novelty
+            + alpha['gain'] * norm_gain
+            + alpha['feas'] * (1.0 - feasibility)
+        )
+        results.append({
+            'concept_u': u_c, 'concept_v': v_c,
+            'gnn_affinity': float(gnn_scores[i]),
+            'semantic_novelty': float(semantic_novelty),
+            'expected_property_gain': expected_improvement,
+            'feasibility_score': float(feasibility),
+            'composite_score': float(D_uv),
+        })
+    df = pd.DataFrame(results).sort_values('composite_score', ascending=False)
+    del emb_np
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return df.head(min(100, len(df)))
+
+
+# ============================================================================
+# MATHEMATICAL VALIDATION
+# ============================================================================
+def validate_graph_metrics(
+    nx_graph: nx.Graph, valid_concepts: List[str]
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {}
+    if nx_graph.number_of_nodes() < 3:
+        return metrics
+    try:
+        from networkx.algorithms import community
+        partition = list(community.greedy_modularity_communities(nx_graph))
+        metrics["modularity"] = community.modularity(nx_graph, partition)
+        metrics["n_communities"] = len(partition)
+    except Exception:
+        metrics["modularity"] = 0.0
+        metrics["n_communities"] = 0
+    try:
+        embed_model = load_embedding_model()
+        with torch.no_grad():
+            embeddings = embed_model.encode(
+                valid_concepts, show_progress_bar=False,
+                batch_size=64, convert_to_numpy=True,
+            )
+        if len(valid_concepts) >= 3:
+            labels = np.zeros(len(valid_concepts))
+            for i, c in enumerate(valid_concepts):
+                for idx, comm in enumerate(
+                    partition if 'partition' in locals() else [[]]
+                ):
+                    if c in comm:
+                        labels[i] = idx
+                        break
+            metrics["silhouette_score"] = silhouette_score(embeddings, labels)
+        else:
+            metrics["silhouette_score"] = 0.0
+        del embeddings
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        metrics["silhouette_score"] = 0.0
+    weights = [d.get('weight', 1) for _, _, d in nx_graph.edges(data=True)]
+    if len(weights) > 10:
+        p_values = []
+        for w in weights[:50]:
+            permuted = np.random.permutation(weights)
+            p_values.append(np.sum(permuted >= w) / len(weights))
+        metrics["edge_significance_p_mean"] = float(np.mean(p_values))
+        metrics["edge_significant_count"] = int(
+            sum(1 for p in p_values if p < 0.05)
+        )
+    else:
+        metrics["edge_significance_p_mean"] = 1.0
+        metrics["edge_significant_count"] = 0
+    try:
+        metrics["avg_betweenness"] = np.mean(
+            list(nx.betweenness_centrality(nx_graph).values())
+        )
+        metrics["avg_closeness"] = np.mean(
+            list(nx.closeness_centrality(nx_graph).values())
+        )
+    except Exception:
+        pass
+    return metrics
+
+
+@st.cache_data(ttl=3600)
+def compute_bootstrap_ci(
+    scores: np.ndarray, n_bootstrap: int = 500, alpha: float = 0.05
+) -> Tuple[float, float, float]:
+    if len(scores) < 2:
+        return float(np.mean(scores)), 0.0, 0.0
+    boot_means: List[float] = []
+    for _ in range(n_bootstrap):
+        sample = np.random.choice(scores, size=len(scores), replace=True)
+        boot_means.append(float(np.mean(sample)))
+    ci_low = float(np.percentile(boot_means, 100 * alpha / 2))
+    ci_high = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))
+    return float(np.mean(scores)), ci_low, ci_high
+
+
+# ============================================================================
+# ADVANCED ANALYTICS (CACHED)
+# ============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def detect_keyword_bursts(
+    df_filtered: pd.DataFrame,
+    valid_concepts: List[str],
+    concept_abstract_map: Dict[str, List[int]],
+    text_columns: List[str],
+    burst_threshold: float = 2.0,
+) -> pd.DataFrame:
+    if "Year" not in df_filtered.columns or df_filtered["Year"].isna().all():
+        return pd.DataFrame()
+    years = df_filtered["Year"].dropna().astype(int)
+    if len(years.unique()) < 3:
+        return pd.DataFrame()
+    year_range = sorted(years.unique())
+    burst_data: List[Dict[str, Any]] = []
+    for concept in valid_concepts:
+        doc_indices = concept_abstract_map.get(concept, [])
+        if len(doc_indices) < 5:
+            continue
+        concept_years: List[int] = []
+        for idx in doc_indices:
+            if (
+                idx < len(df_filtered)
+                and pd.notna(df_filtered.iloc[idx].get("Year"))
+            ):
+                concept_years.append(int(df_filtered.iloc[idx]["Year"]))
+        if len(concept_years) < 3:
+            continue
+        year_counts = Counter(concept_years)
+        counts = [year_counts.get(y, 0) for y in year_range]
+        if len(counts) < 3:
+            continue
+        window = max(2, len(counts) // 5)
+        moving_avg = pd.Series(counts).rolling(
+            window=window, min_periods=1
+        ).mean()
+        burst_scores: List[float] = []
+        for i in range(window, len(counts)):
+            if moving_avg.iloc[i - 1] > 0:
+                ratio = counts[i] / max(moving_avg.iloc[i - 1], 0.1)
+                burst_scores.append(float(ratio))
+        if burst_scores:
+            max_burst = max(burst_scores)
+            burst_year = year_range[window + burst_scores.index(max_burst)]
+            if max_burst >= burst_threshold:
+                burst_data.append({
+                    "concept": concept,
+                    "burst_score": round(max_burst, 2),
+                    "burst_year": burst_year,
+                    "total_mentions": len(concept_years),
+                    "year_range": f"{min(concept_years)}-{max(concept_years)}",
+                })
+    return pd.DataFrame(burst_data).sort_values(
+        "burst_score", ascending=False
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def detect_semantic_drift(
+    df_filtered: pd.DataFrame,
+    valid_concepts: List[str],
+    concept_abstract_map: Dict[str, List[int]],
+    text_columns: List[str],
+    early_fraction: float = 0.3,
+    late_fraction: float = 0.3,
+) -> pd.DataFrame:
+    if "Year" not in df_filtered.columns or df_filtered["Year"].isna().all():
+        return pd.DataFrame()
+    years = df_filtered["Year"].dropna().astype(int)
+    if len(years.unique()) < 4:
+        return pd.DataFrame()
+    embed_model = load_embedding_model()
+    sorted_years = sorted(years.unique())
+    n_years = len(sorted_years)
+    early_cutoff = sorted_years[int(n_years * early_fraction)]
+    late_cutoff = sorted_years[int(n_years * (1 - late_fraction))]
+    drift_data: List[Dict[str, Any]] = []
+    for concept in valid_concepts:
+        doc_indices = concept_abstract_map.get(concept, [])
+        if len(doc_indices) < 10:
+            continue
+        early_texts: List[str] = []
+        late_texts: List[str] = []
+        for idx in doc_indices:
+            if idx >= len(df_filtered):
+                continue
+            row = df_filtered.iloc[idx]
+            year = row.get("Year")
+            if pd.isna(year):
+                continue
+            year = int(year)
+            text = " ".join([
+                str(row.get(col, ""))
+                for col in text_columns if pd.notna(row.get(col))
+            ])
+            if year <= early_cutoff:
+                early_texts.append(text)
+            elif year >= late_cutoff:
+                late_texts.append(text)
+        if len(early_texts) < 3 or len(late_texts) < 3:
+            continue
+        try:
+            with torch.no_grad():
+                early_emb = embed_model.encode(
+                    early_texts, show_progress_bar=False,
+                    batch_size=32, convert_to_numpy=True,
+                )
+                late_emb = embed_model.encode(
+                    late_texts, show_progress_bar=False,
+                    batch_size=32, convert_to_numpy=True,
+                )
+            early_centroid = np.mean(early_emb, axis=0)
+            late_centroid = np.mean(late_emb, axis=0)
+            drift = 1.0 - cosine_similarity(
+                [early_centroid], [late_centroid]
+            )[0][0]
+            drift_data.append({
+                "concept": concept,
+                "semantic_drift": round(float(drift), 4),
+                "early_papers": len(early_texts),
+                "late_papers": len(late_texts),
+                "early_period": f"{sorted_years[0]}-{early_cutoff}",
+                "late_period": f"{late_cutoff}-{sorted_years[-1]}",
+            })
+            del early_emb, late_emb
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            continue
+    return pd.DataFrame(drift_data).sort_values(
+        "semantic_drift", ascending=False
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_concept_genealogy(
+    _nx_graph: nx.Graph,
+    valid_concepts: List[str],
+    concept_abstract_map: Dict[str, List[int]],
+) -> pd.DataFrame:
+    if _nx_graph.number_of_nodes() < 5:
+        return pd.DataFrame()
+    try:
+        pagerank = nx.pagerank(_nx_graph, weight='weight')
+    except Exception:
+        pagerank = {n: 1.0 for n in _nx_graph.nodes()}
+    try:
+        betweenness = nx.betweenness_centrality(_nx_graph, weight='weight')
+    except Exception:
+        betweenness = {n: 0.0 for n in _nx_graph.nodes()}
+    genealogy_data: List[Dict[str, Any]] = []
+    for concept in valid_concepts:
+        if concept not in _nx_graph:
+            continue
+        pr = pagerank.get(concept, 0)
+        bc = betweenness.get(concept, 0)
+        freq = len(concept_abstract_map.get(concept, []))
+        degree = _nx_graph.degree(concept)
+        if (
+            pr > np.percentile(list(pagerank.values()), 75)
+            and degree > np.percentile(
+                [_nx_graph.degree(n) for n in _nx_graph.nodes()], 75
+            )
+        ):
+            generation = "Foundational (Parent)"
+        elif (
+            pr < np.percentile(list(pagerank.values()), 25)
+            and degree < np.percentile(
+                [_nx_graph.degree(n) for n in _nx_graph.nodes()], 25
+            )
+        ):
+            generation = "Emerging (Child)"
+        else:
+            generation = "Intermediate"
+        genealogy_data.append({
+            "concept": concept,
+            "pagerank": round(pr, 5),
+            "betweenness": round(bc, 5),
+            "frequency": freq,
+            "degree": degree,
+            "generation": generation,
+        })
+    return pd.DataFrame(genealogy_data).sort_values(
+        "pagerank", ascending=False
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def detect_cross_domain_bridges(
+    _nx_graph: nx.Graph,
+    valid_concepts: List[str],
+    concept_abstract_map: Dict[str, List[int]],
+) -> pd.DataFrame:
+    _BRIDGE_COLUMNS = [
+        "concept", "bridge_score", "betweenness",
+        "connected_categories", "categories",
+        "degree", "own_category",
+    ]
+    if _nx_graph.number_of_nodes() < 5:
+        return pd.DataFrame(columns=_BRIDGE_COLUMNS)
+    category_map = {c: categorize_dendrite_concept(c) for c in valid_concepts}
+    try:
+        betweenness = nx.betweenness_centrality(_nx_graph, weight='weight')
+    except Exception:
+        betweenness = {n: 0.0 for n in _nx_graph.nodes()}
+    bridge_data: List[Dict[str, Any]] = []
+    for concept in valid_concepts:
+        if concept not in _nx_graph:
+            continue
+        neighbors = list(_nx_graph.neighbors(concept))
+        if len(neighbors) < 2:
+            continue
+        own_cat = category_map.get(concept, 'general')
+        neighbor_cats = [category_map.get(n, 'general') for n in neighbors]
+        unique_cats = set(neighbor_cats)
+        if len(unique_cats) < 2:
+            continue
+        bridge_score = betweenness.get(concept, 0) * len(unique_cats)
+        bridge_data.append({
+            "concept": concept,
+            "bridge_score": round(bridge_score, 4),
+            "betweenness": round(betweenness.get(concept, 0), 4),
+            "connected_categories": len(unique_cats),
+            "categories": ", ".join(sorted(unique_cats)),
+            "degree": len(neighbors),
+            "own_category": own_cat,
+        })
+    if not bridge_data:
+        return pd.DataFrame(columns=_BRIDGE_COLUMNS)
+    df = pd.DataFrame(bridge_data)
+    if "bridge_score" not in df.columns:
+        df["bridge_score"] = 0.0
+    return df.sort_values("bridge_score", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def analyze_network_motifs(_nx_graph: nx.Graph) -> Dict[str, Any]:
+    if _nx_graph.number_of_nodes() < 3:
+        return {}
+    motifs: Dict[str, Any] = {}
+    try:
+        triangles = nx.triangles(_nx_graph)
+        motifs["total_triangles"] = sum(triangles.values()) // 3
+        motifs["avg_triangles_per_node"] = round(
+            np.mean(list(triangles.values())), 2
+        )
+        motifs["nodes_in_triangles"] = sum(
+            1 for v in triangles.values() if v > 0
+        )
+    except Exception:
+        motifs["total_triangles"] = 0
+    try:
+        cliques = list(nx.find_cliques(_nx_graph))
+        clique_sizes = [len(c) for c in cliques]
+        motifs["total_cliques"] = len(cliques)
+        motifs["max_clique_size"] = max(clique_sizes) if clique_sizes else 0
+        motifs["avg_clique_size"] = (
+            round(np.mean(clique_sizes), 2) if clique_sizes else 0
+        )
+        motifs["4cliques"] = sum(1 for c in clique_sizes if c >= 4)
+    except Exception:
+        motifs["total_cliques"] = 0
+    try:
+        clustering = nx.clustering(_nx_graph)
+        stars: List[Tuple[str, int, float]] = []
+        for node in _nx_graph.nodes():
+            deg = _nx_graph.degree(node)
+            clust = clustering.get(node, 0)
+            if deg >= 5 and clust < 0.2:
+                stars.append((node, deg, clust))
+        stars.sort(key=lambda x: x[1], reverse=True)
+        motifs["star_motifs"] = len(stars)
+        motifs["top_stars"] = stars[:10]
+    except Exception:
+        motifs["star_motifs"] = 0
+    return motifs
+
+
+# ============================================================================
+# CENTRALITY & DEGREE DISTRIBUTION
+# ============================================================================
+def compute_centrality_comparison(
+    nx_graph: nx.Graph, valid_concepts: List[str]
+) -> pd.DataFrame:
+    if nx_graph.number_of_nodes() < 3:
+        return pd.DataFrame()
+    centrality_data: List[Dict[str, Any]] = []
+    try:
+        degree_c = dict(nx_graph.degree())
+        betweenness_c = nx.betweenness_centrality(nx_graph, weight='weight')
+        closeness_c = nx.closeness_centrality(nx_graph)
+        eigenvector_c = nx.eigenvector_centrality(
+            nx_graph, weight='weight', max_iter=1000
+        )
+        pagerank_c = nx.pagerank(nx_graph, weight='weight')
+        for concept in valid_concepts:
+            if concept not in nx_graph:
+                continue
+            centrality_data.append({
+                "concept": concept,
+                "degree": degree_c.get(concept, 0),
+                "betweenness": round(betweenness_c.get(concept, 0), 5),
+                "closeness": round(closeness_c.get(concept, 0), 5),
+                "eigenvector": round(eigenvector_c.get(concept, 0), 5),
+                "pagerank": round(pagerank_c.get(concept, 0), 5),
+            })
+    except Exception as e:
+        st.warning(f"Centrality computation error: {e}")
+    return pd.DataFrame(centrality_data)
+
+
+def plot_degree_distribution(
+    nx_graph: nx.Graph, theme: Dict = None
+) -> go.Figure:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    degrees = [d for n, d in nx_graph.degree()]
+    if len(degrees) < 3:
+        return go.Figure()
+    degree_counts = Counter(degrees)
+    x = sorted(degree_counts.keys())
+    y = [degree_counts[k] for k in x]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode='markers', name='Degree Distribution',
+        marker=dict(size=10, color=theme.get('highlight_bg', '#ff6b6b')),
+    ))
+    fig.update_layout(
+        title="Degree Distribution (Log-Log)",
+        xaxis_type="log", yaxis_type="log",
+        xaxis_title="Degree (k)", yaxis_title="Frequency P(k)",
+        paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+        plot_bgcolor=theme.get("plotly_bg", "#ffffff"),
+        font_color=theme.get("font", "#000000"),
+    )
+    return fig
+
+
+# ============================================================================
+# PUBLICATION-READY EXPORTS
+# ============================================================================
+def export_publication_figure(
+    nx_graph, valid_concepts, concept_abstract_map,
+    cmap_name="viridis", dpi=300, figsize=(14, 12),
+    filename="dendrite_graph_pub.png",
+) -> bytes:
+    try:
+        pos = nx.spring_layout(nx_graph, seed=42, k=2.5, iterations=200)
+        plt.figure(figsize=figsize, dpi=dpi)
+        node_colors = [get_dendrite_category_color(n) for n in nx_graph.nodes()]
+        node_sizes = [
+            max(100, min(800, len(concept_abstract_map.get(n, [])) * 20 + 50))
+            for n in nx_graph.nodes()
+        ]
+        nx.draw(
+            nx_graph, pos,
+            with_labels=True,
+            node_color=node_colors,
+            edge_color='lightgray',
+            node_size=node_sizes,
+            font_size=6,
+            font_weight='bold',
+            edgecolors='white',
+            linewidths=1.5,
+            width=0.5,
+            alpha=0.9,
+        )
+        plt.title(
+            "Dendrite Growth in Partitioned Electrolytes Concept Graph",
+            fontsize=14, fontweight='bold', pad=20,
+        )
+        buf = io.BytesIO()
+        plt.savefig(
+            buf, format='png', dpi=dpi, bbox_inches='tight',
+            facecolor='white', edgecolor='none',
+        )
+        buf.seek(0)
+        plt.close()
+        return buf.read()
+    except Exception as e:
+        st.error(f"Publication figure export failed: {e}")
+        return b''
+
+
+def generate_analysis_report(
+    nx_graph, valid_concepts, concept_abstract_map,
+    top_scores, distill_df, burst_df, drift_df,
+    genealogy_df, bridge_df, motifs, val_metrics,
+    df_filtered,
+) -> str:
+    report: List[str] = []
+    report.append("# Dendrite Growth in Partitioned Electrolytes Concept Graph Analysis Report")
+    report.append(
+        f"\n*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n"
+    )
+    report.append("## 1. Dataset Overview")
+    report.append(f"- **Total Records**: {len(df_filtered)}")
+    if 'Year' in df_filtered.columns:
+        years = df_filtered['Year'].dropna()
+        report.append(
+            f"- **Year Range**: {int(years.min())} - {int(years.max())}"
+        )
+    report.append(f"- **Total Concepts**: {len(valid_concepts)}")
+    report.append(f"- **Total Edges**: {nx_graph.number_of_edges()}")
+    report.append(f"- **Graph Density**: {nx.density(nx_graph):.4f}")
+    report.append("")
+    report.append("## 2. Top Concepts by Frequency")
+    top_concepts = sorted(
+        valid_concepts,
+        key=lambda c: len(concept_abstract_map.get(c, [])),
+        reverse=True,
+    )[:20]
+    for i, c in enumerate(top_concepts, 1):
+        freq = len(concept_abstract_map.get(c, []))
+        deg = nx_graph.degree(c)
+        report.append(f"{i}. **{c}** - Freq: {freq}, Degree: {deg}")
+    report.append("")
+    report.append("## 3. Concept Distillation Efficiency (Top 15)")
+    if not distill_df.empty:
+        for _, row in distill_df.head(15).iterrows():
+            report.append(
+                f"- **{row['concept']}**: Efficiency="
+                f"{row['distillation_efficiency']:.3f}, "
+                f"Freq={row['frequency']}, "
+                f"Coherence={row['coherence_score']:.3f}"
+            )
+    report.append("")
+    report.append("## 4. Research Direction Recommendations (Top 10)")
+    if not top_scores.empty:
+        for i, (_, row) in enumerate(top_scores.head(10).iterrows(), 1):
+            report.append(
+                f"{i}. **{row['concept_u']}** + **{row['concept_v']}** - "
+                f"Composite Score: {row['composite_score']:.3f}"
+            )
+    report.append("")
+    report.append("## 5. Keyword Burst Detection")
+    if not burst_df.empty:
+        for _, row in burst_df.head(10).iterrows():
+            report.append(
+                f"- **{row['concept']}**: Burst Score={row['burst_score']:.2f} "
+                f"(Year {row['burst_year']})"
+            )
+    else:
+        report.append("No significant keyword bursts detected.")
+    report.append("")
+    report.append("## 6. Semantic Drift Detection")
+    if not drift_df.empty:
+        for _, row in drift_df.head(10).iterrows():
+            report.append(
+                f"- **{row['concept']}**: Drift={row['semantic_drift']:.4f} "
+                f"({row['early_period']} -> {row['late_period']})"
+            )
+    else:
+        report.append("No significant semantic drift detected.")
+    report.append("")
+    report.append("## 7. Cross-Domain Bridge Concepts")
+    if not bridge_df.empty:
+        for _, row in bridge_df.head(10).iterrows():
+            report.append(
+                f"- **{row['concept']}**: Bridge Score={row['bridge_score']:.4f}, "
+                f"Connects {row['connected_categories']} categories"
+            )
+    else:
+        report.append("No cross-domain bridges detected.")
+    report.append("")
+    report.append("## 8. Network Motif Analysis")
+    report.append(f"- Total Triangles: {motifs.get('total_triangles', 0)}")
+    report.append(f"- Total Cliques: {motifs.get('total_cliques', 0)}")
+    report.append(f"- Max Clique Size: {motifs.get('max_clique_size', 0)}")
+    report.append(f"- Star Motifs: {motifs.get('star_motifs', 0)}")
+    report.append("")
+    report.append("## 9. Graph Validation Metrics")
+    report.append(f"- Modularity: {val_metrics.get('modularity', 0):.3f}")
+    report.append(
+        f"- Silhouette Score: {val_metrics.get('silhouette_score', 0):.3f}"
+    )
+    report.append(f"- Number of Communities: {val_metrics.get('n_communities', 0)}")
+    report.append(f"- Avg Betweenness: {val_metrics.get('avg_betweenness', 0):.3f}")
+    report.append("")
+    report.append("---")
+    report.append("*Report generated by Dendrite Growth Concept Graph v6.2*")
+    return "\n".join(report)
+
+
+# ============================================================================
+# GRAPH EDIT HISTORY
+# ============================================================================
+class GraphEditHistory:
+    def __init__(self, max_history: int = 20) -> None:
+        self.history: deque = deque(maxlen=max_history)
+        self.redo_stack: deque = deque(maxlen=max_history)
+        self._snapshot_counter = 0
+
+    def save_snapshot(
+        self, nx_graph, valid_concepts, concept_to_id,
+        id_to_concept, concept_abstract_map,
+    ) -> int:
+        snapshot = {
+            'id': self._snapshot_counter,
+            'nx_graph': copy.copy(nx_graph),
+            'valid_concepts': list(valid_concepts),
+            'concept_to_id': dict(concept_to_id),
+            'id_to_concept': dict(id_to_concept),
+            'concept_abstract_map': {
+                k: list(v) for k, v in concept_abstract_map.items()
+            },
+            'timestamp': datetime.now().isoformat(),
+        }
+        self.history.append(snapshot)
+        self._snapshot_counter += 1
+        self.redo_stack.clear()
+        return snapshot['id']
+
+    def undo(self) -> Optional[Dict]:
+        if len(self.history) < 2:
+            return None
+        current = self.history.pop()
+        self.redo_stack.append(current)
+        previous = self.history[-1]
+        return previous
+
+    def redo(self) -> Optional[Dict]:
+        if not self.redo_stack:
+            return None
+        snapshot = self.redo_stack.pop()
+        self.history.append(snapshot)
+        return snapshot
+
+    def can_undo(self) -> bool:
+        return len(self.history) >= 2
+
+    def can_redo(self) -> bool:
+        return len(self.redo_stack) > 0
+
+    def get_history_summary(self) -> List[str]:
+        return [
+            f"Snapshot {s['id']} @ {s['timestamp']}" for s in self.history
+        ]
+
+
+# ============================================================================
+# CENTRALITY & METRICS DASHBOARD
+# ============================================================================
+def compute_graph_metrics(G: nx.Graph) -> Dict[str, Any]:
+    if G.number_of_nodes() == 0:
+        return {}
+    metrics: Dict[str, Any] = {
+        "nodes": G.number_of_nodes(),
+        "edges": G.number_of_edges(),
+        "density": nx.density(G),
+        "avg_degree": np.mean([d for _, d in G.degree()]),
+        "clustering": (
+            nx.average_clustering(G) if G.number_of_nodes() > 2 else 0
+        ),
+        "connected_components": nx.number_connected_components(G),
+        "avg_clustering": (
+            nx.average_clustering(G) if G.number_of_nodes() > 2 else 0
+        ),
+    }
+    try:
+        bc = nx.betweenness_centrality(
+            G, normalized=True, k=min(100, G.number_of_nodes())
+        )
+        top_bridges = sorted(
+            bc.items(), key=lambda x: x[1], reverse=True
+        )[:10]
+        metrics["top_bridges"] = top_bridges
+        metrics["avg_betweenness"] = np.mean(list(bc.values()))
+    except Exception:
+        metrics["top_bridges"] = []
+    return metrics
+
+def display_metric_dashboard(metrics: Dict, theme=None) -> None:
+    if not metrics:
+        st.warning("No graph metrics available.")
+        return
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Nodes", metrics["nodes"])
+    col2.metric("Edges", metrics["edges"])
+    col3.metric("Density", f"{metrics['density']:.3f}")
+    col4.metric("Avg Degree", f"{metrics['avg_degree']:.2f}")
+    col5, col6, col7 = st.columns(3)
+    col5.metric("Clustering", f"{metrics['clustering']:.3f}")
+    col6.metric("Components", metrics["connected_components"])
+    col7.metric(
+        "Avg Betweenness", f"{metrics.get('avg_betweenness', 0):.3f}"
+    )
+    if metrics.get("top_bridges"):
+        st.markdown("**Top Bridge Concepts (High Betweenness)**")
+        bridge_df = pd.DataFrame(
+            metrics["top_bridges"], columns=["Concept", "Bridge Score"]
+        )
+        st.dataframe(bridge_df, width="stretch")
+
+# ============================================================================
+# THEME CONFIGURATION
+# ============================================================================
+THEME_PRESETS = {
+    "Bright (Default)": {
+        "bg": "#ffffff", "font": "#1e293b",
+        "tooltip_bg": "rgba(255,255,255,0.95)",
+        "tooltip_border": "#cbd5e1", "tooltip_text": "#1e293b",
+        "edge_cooccurrence": "rgba(56, 189, 248, 0.45)",
+        "edge_semantic": "rgba(251, 146, 60, 0.40)",
+        "edge_bridge": "rgba(250, 204, 21, 0.55)",
+        "edge_inferred": "rgba(139, 92, 246, 0.50)",
+        "edge_cause": "rgba(239, 68, 68, 0.55)",
+        "edge_hypernym": "rgba(34, 197, 94, 0.45)",
+        "edge_unknown": "rgba(148, 163, 184, 0.30)",
+        "node_border": "#f8fafc", "highlight_bg": "#ff6b6b",
+        "hover_bg": "#ffd93d",
+        "shadow_color": "rgba(0,0,0,0.15)",
+        "plotly_bg": "#ffffff", "plotly_paper": "#ffffff",
+        "grid_color": "#e2e8f0", "axis_color": "#64748b",
+    },
+    "Dark": {
+        "bg": "#0f172a", "font": "#e2e8f0",
+        "tooltip_bg": "rgba(15, 23, 42, 0.95)",
+        "tooltip_border": "#334155", "tooltip_text": "#e2e8f0",
+        "edge_cooccurrence": "rgba(56, 189, 248, 0.55)",
+        "edge_semantic": "rgba(251, 146, 60, 0.50)",
+        "edge_bridge": "rgba(250, 204, 21, 0.65)",
+        "edge_inferred": "rgba(139, 92, 246, 0.60)",
+        "edge_cause": "rgba(239, 68, 68, 0.65)",
+        "edge_hypernym": "rgba(34, 197, 94, 0.55)",
+        "edge_unknown": "rgba(148, 163, 184, 0.40)",
+        "node_border": "#f8fafc", "highlight_bg": "#ff6b6b",
+        "hover_bg": "#ffd93d",
+        "shadow_color": "rgba(0,0,0,0.6)",
+        "plotly_bg": "#0f172a", "plotly_paper": "#0f172a",
+        "grid_color": "#1e293b", "axis_color": "#94a3b8",
+    },
+    "Midnight": {
+        "bg": "#020617", "font": "#f1f5f9",
+        "tooltip_bg": "rgba(2, 6, 23, 0.97)",
+        "tooltip_border": "#1e293b", "tooltip_text": "#f1f5f9",
+        "edge_cooccurrence": "rgba(99, 102, 241, 0.55)",
+        "edge_semantic": "rgba(236, 72, 153, 0.50)",
+        "edge_bridge": "rgba(34, 211, 238, 0.65)",
+        "edge_inferred": "rgba(168, 85, 247, 0.60)",
+        "edge_cause": "rgba(244, 63, 94, 0.65)",
+        "edge_hypernym": "rgba(52, 211, 153, 0.55)",
+        "edge_unknown": "rgba(71, 85, 105, 0.40)",
+        "node_border": "#e2e8f0", "highlight_bg": "#f43f5e",
+        "hover_bg": "#22d3ee",
+        "shadow_color": "rgba(0,0,0,0.7)",
+        "plotly_bg": "#020617", "plotly_paper": "#020617",
+        "grid_color": "#0f172a", "axis_color": "#64748b",
+    },
+    "Warm": {
+        "bg": "#fff7ed", "font": "#431407",
+        "tooltip_bg": "rgba(255, 247, 237, 0.97)",
+        "tooltip_border": "#fdba74", "tooltip_text": "#431407",
+        "edge_cooccurrence": "rgba(234, 88, 12, 0.45)",
+        "edge_semantic": "rgba(180, 83, 9, 0.40)",
+        "edge_bridge": "rgba(202, 138, 4, 0.55)",
+        "edge_inferred": "rgba(147, 51, 234, 0.50)",
+        "edge_cause": "rgba(220, 38, 38, 0.55)",
+        "edge_hypernym": "rgba(22, 163, 74, 0.45)",
+        "edge_unknown": "rgba(120, 53, 15, 0.25)",
+        "node_border": "#fff7ed", "highlight_bg": "#dc2626",
+        "hover_bg": "#f59e0b",
+        "shadow_color": "rgba(124, 45, 18, 0.15)",
+        "plotly_bg": "#fff7ed", "plotly_paper": "#fff7ed",
+        "grid_color": "#fed7aa", "axis_color": "#9a3412",
+    },
+    "Forest": {
+        "bg": "#f0fdf4", "font": "#052e16",
+        "tooltip_bg": "rgba(240, 253, 244, 0.97)",
+        "tooltip_border": "#86efac", "tooltip_text": "#052e16",
+        "edge_cooccurrence": "rgba(22, 163, 74, 0.45)",
+        "edge_semantic": "rgba(5, 150, 105, 0.40)",
+        "edge_bridge": "rgba(234, 179, 8, 0.55)",
+        "edge_inferred": "rgba(139, 92, 246, 0.50)",
+        "edge_cause": "rgba(239, 68, 68, 0.55)",
+        "edge_hypernym": "rgba(21, 128, 61, 0.45)",
+        "edge_unknown": "rgba(20, 83, 45, 0.25)",
+        "node_border": "#f0fdf4", "highlight_bg": "#15803d",
+        "hover_bg": "#84cc16",
+        "shadow_color": "rgba(20, 83, 45, 0.15)",
+        "plotly_bg": "#f0fdf4", "plotly_paper": "#f0fdf4",
+        "grid_color": "#bbf7d0", "axis_color": "#166534",
+    },
+    "Ocean": {
+        "bg": "#ecfeff", "font": "#083344",
+        "tooltip_bg": "rgba(236, 254, 255, 0.97)",
+        "tooltip_border": "#67e8f9", "tooltip_text": "#083344",
+        "edge_cooccurrence": "rgba(6, 182, 212, 0.45)",
+        "edge_semantic": "rgba(14, 165, 233, 0.40)",
+        "edge_bridge": "rgba(99, 102, 241, 0.55)",
+        "edge_inferred": "rgba(168, 85, 247, 0.50)",
+        "edge_cause": "rgba(244, 63, 94, 0.55)",
+        "edge_hypernym": "rgba(13, 148, 136, 0.45)",
+        "edge_unknown": "rgba(21, 94, 117, 0.25)",
+        "node_border": "#ecfeff", "highlight_bg": "#0ea5e9",
+        "hover_bg": "#22d3ee",
+        "shadow_color": "rgba(8, 51, 68, 0.15)",
+        "plotly_bg": "#ecfeff", "plotly_paper": "#ecfeff",
+        "grid_color": "#a5f3fc", "axis_color": "#0e7490",
+    },
+}
+
+PHYSICS_PRESETS = {
+    "Stable (Default)": {
+        "damping": 0.55, "gravity": -2500, "spring_length": 140,
+        "spring_strength": 0.05, "central_gravity": 0.25,
+        "stabilization": 2500,
+    },
+    "Fluid": {
+        "damping": 0.25, "gravity": -1800, "spring_length": 120,
+        "spring_strength": 0.05, "central_gravity": 0.30,
+        "stabilization": 1500,
+    },
+    "Tight": {
+        "damping": 0.70, "gravity": -4000, "spring_length": 80,
+        "spring_strength": 0.08, "central_gravity": 0.20,
+        "stabilization": 3000,
+    },
+    "Off": {
+        "damping": 0.99, "gravity": 0, "spring_length": 200,
+        "spring_strength": 0.0, "central_gravity": 0.0,
+        "stabilization": 0,
+    },
+}
+
+
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
+def render_graph_pyvis(
+    nx_graph, concept_abstract_map, physics_enabled=True,
+    min_node_size=8, max_node_size=40, cmap_name="viridis",
+    custom_labels=None, node_label_size=12, node_label_position="center",
+    top_n_nodes=0, theme=None, physics_preset=None,
+    show_edge_weights=False, edge_label_mode="hover",
+    use_abbreviated_labels=False,
+    max_label_length=15,
+    node_font_face="Inter, Segoe UI, Roboto, sans-serif",
+    edge_label_size=10, edge_label_color=None,
+    edge_label_position="middle", enable_node_highlight=True,
+    show_definitions=True,
+    edge_lightness=0.6,
+    edge_color_mode="theme",
+    custom_edge_color="#AAAAAA",
+    tooltip_font_size=13,
+    node_legend_font_size=13,
+) -> None:
+    if top_n_nodes > 0 and len(nx_graph.nodes()) > top_n_nodes:
+        degrees = dict(nx_graph.degree(weight='weight'))
+        top_nodes = sorted(
+            degrees.keys(), key=lambda x: degrees[x], reverse=True
+        )[:top_n_nodes]
+        nx_graph = nx_graph.subgraph(top_nodes).copy()
+
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if physics_preset is None:
+        physics_preset = PHYSICS_PRESETS["Stable (Default)"]
+
+    cmap_colors = get_colormap_colors(
+        cmap_name, max(1, len(nx_graph.nodes()))
+    )
+    net = Network(
+        height="780px", width="100%",
+        bgcolor=theme['bg'], font_color=theme['font'],
+        select_menu=True, notebook=False, cdn_resources='remote',
+    )
+
+    if physics_enabled and physics_preset.get("gravity", 0) != 0:
+        net.set_options(f"""
+var options = {{
+    "physics": {{
+        "enabled": true,
+        "solver": "barnesHut",
+        "barnesHut": {{
+            "gravitationalConstant": {physics_preset['gravity']},
+            "centralGravity": {physics_preset['central_gravity']},
+            "springLength": {physics_preset['spring_length']},
+            "springConstant": {physics_preset['spring_strength']},
+            "damping": {physics_preset['damping']},
+            "overlap": 0.15
+        }},
+        "stabilization": {{
+            "enabled": true,
+            "iterations": 500,
+            "updateInterval": 50,
+            "onlyDynamicEdges": true,
+            "fit": true
+        }}
+    }},
+    "interaction": {{
+        "hover": true,
+        "tooltipDelay": 180,
+        "hideEdgesOnDrag": false,
+        "zoomView": true,
+        "dragView": true
+    }}
+}}
+""")
+    else:
+        net.set_options("""
+var options = {
+    "physics": { "enabled": false },
+    "interaction": {
+        "hover": true, "dragNodes": true,
+        "dragView": true, "zoomView": true
+    }
+}
+""")
+
+    label_map = {}
+    n_counter = 1
+    used_rel_types = {}
+
+    for i, node in enumerate(nx_graph.nodes()):
+        freq = len(concept_abstract_map.get(node, []))
+        size = int(np.clip(
+            min_node_size + freq * 1.2, min_node_size, max_node_size
+        ))
+        color = get_dendrite_category_color(node, cmap_colors)
+        degree = int(nx_graph.degree(node))
+        original_label = (
+            custom_labels.get(node, node) if custom_labels else node
+        )
+        label = get_hierarchy_label(node, style="arrow")
+
+        if (
+            use_abbreviated_labels
+            and len(original_label) > max_label_length
+        ):
+            short_label = f"N{n_counter}"
+            label_map[short_label] = original_label
+            n_counter += 1
+            label = short_label
+            node_shape = 'circle'
+            max_allowed_by_node = int(size * 0.55)
+            inside_font_size = max(6, min(int(node_label_size), max_allowed_by_node))
+            font_dict = {
+                'color': '#ffffff',
+                'size': inside_font_size,
+                'face': node_font_face,
+                'bold': True,
+            }
+        else:
+            label = label
+            node_shape = 'dot'
+            v_adjust = 0
+            if node_label_position == "top":
+                v_adjust = -int(node_label_size) - 4
+            elif node_label_position == "bottom":
+                v_adjust = int(node_label_size) + 4
+            font_dict = {
+                'color': theme['font'],
+                'size': int(node_label_size),
+                'face': node_font_face,
+                'strokeWidth': 0,
+                'vadjust': v_adjust,
+            }
+
+        concept_type = nx_graph.nodes[node].get('concept_type', 'general')
+        definition = nx_graph.nodes[node].get('definition', '')
+        tooltip_content = (
+            f"<div style='font-family:{node_font_face};'>"
+            f"<b style='font-size:14px;color:{theme['highlight_bg']};'>"
+            f"{node}</b><br>"
+            f"<span style='color:{theme['tooltip_text']};opacity:0.7;'>"
+            f"Type:</span> {concept_type}<br>"
+            f"<span style='color:{theme['tooltip_text']};opacity:0.7;'>"
+            f"Degree:</span> {degree}<br>"
+            f"<span style='color:{theme['tooltip_text']};opacity:0.7;'>"
+            f"Frequency:</span> {freq}"
+        )
+        if show_definitions and definition:
+            tooltip_content += (
+                f"<br><span style='color:{theme['tooltip_text']};opacity:0.7;'>"
+                f"Definition:</span> <i>{definition}</i>"
+            )
+        if use_abbreviated_labels and label != original_label:
+            tooltip_content += (
+                f"<br><span style='color:{theme['tooltip_text']};opacity:0.7;'>"
+                f"Full Label:</span> {original_label}"
+            )
+        tooltip_content += "</div>"
+
+        net.add_node(
+            node, label=label, size=size,
+            color={
+                'background': color,
+                'border': theme['node_border'],
+                'highlight': {
+                    'background': theme['highlight_bg'], 'border': '#ffffff'
+                },
+                'hover': {
+                    'background': theme['hover_bg'], 'border': '#ffffff'
+                },
+            },
+            font=font_dict, title=tooltip_content,
+            borderWidth=2, borderWidthSelected=3,
+            shadow={
+                'enabled': True,
+                'color': theme['shadow_color'],
+                'size': 12, 'x': 4, 'y': 4,
+            },
+            shape=node_shape,
+        )
+
+    all_weights = [
+        nx_graph[u][v].get('weight', 1) for u, v in nx_graph.edges()
+    ]
+    weight_threshold = (
+        float(np.percentile(all_weights, 80)) if all_weights else 0.0
+    )
+
+    for u, v in nx_graph.edges():
+        w = float(nx_graph[u][v].get('weight', 1))
+        edge_type = nx_graph[u][v].get('edge_type', 'unknown')
+        is_inferred = nx_graph[u][v].get('inferred', False)
+
+        rel_type = RelationshipType.SEMANTIC
+        if edge_type != 'unknown':
+            try:
+                rel_type = RelationshipType(edge_type)
+            except ValueError:
+                pass
+
+        if edge_color_mode == "theme":
+            if edge_type == 'unknown':
+                base_color = theme['edge_unknown']
+            else:
+                base_color = get_edge_color(rel_type)
+            if edge_lightness > 0:
+                base_color = lighten_hex_color(base_color, edge_lightness)
+        elif edge_color_mode == "uniform_grey":
+            base_color = lighten_hex_color("#808080", edge_lightness)
+        else:
+            base_color = lighten_hex_color(custom_edge_color, edge_lightness)
+
+        if edge_type == 'unknown' and edge_color_mode == "theme":
+            base_color = theme['edge_unknown']
+
+        width = float(get_edge_width(rel_type) * (0.5 + 0.5 * w))
+        style = get_edge_style(rel_type)
+        dashes = True if style == "dashed" or is_inferred else False
+
+        actual_edge_label_color = (
+            edge_label_color if edge_label_color else theme['font']
+        )
+        edge_kwargs = dict(
+            value=float(np.clip(w, 0.5, 5)),
+            width=width,
+            color={
+                'color': base_color,
+                'highlight': theme['highlight_bg'],
+                'hover': theme['hover_bg'],
+                'opacity': 0.85,
+            },
+            smooth={"type": "dynamic"},
+            title=(
+                f"<span style='font-family:{node_font_face};'>"
+                f"Weight: <b>{w:.2f}</b><br>"
+                f"Type: {edge_type}<br>"
+                f"Inferred: {is_inferred}</span>"
+            ),
+            dashes=dashes,
+        )
+
+        if (
+            edge_label_mode == "all"
+            or (edge_label_mode == "threshold" and w >= weight_threshold)
+        ):
+            edge_kwargs['label'] = f"{w:.1f}"
+            edge_kwargs['font'] = {
+                'color': actual_edge_label_color,
+                'size': int(edge_label_size),
+                'background': theme['tooltip_bg'],
+                'strokeWidth': 2,
+                'strokeColor': theme['node_border'],
+                'align': edge_label_position,
+                'face': node_font_face,
+            }
+        net.add_edge(u, v, **edge_kwargs)
+
+        if rel_type not in used_rel_types:
+            used_rel_types[rel_type] = rel_type.value.replace("_", " ").title()
+
+    if used_rel_types:
+        legend_rows = []
+        for rt, human in sorted(used_rel_types.items(), key=lambda x: x[1]):
+            c = get_edge_color(rt)
+            if edge_color_mode == "theme":
+                c = lighten_hex_color(c, edge_lightness) if edge_lightness > 0 else c
+            elif edge_color_mode == "uniform_grey":
+                c = lighten_hex_color("#808080", edge_lightness)
+            else:
+                c = lighten_hex_color(custom_edge_color, edge_lightness)
+            w = get_edge_width(rt)
+            s = get_edge_style(rt)
+            border = 'border: 1px dashed #888;' if s == "dashed" else 'border: 1px solid transparent;'
+            legend_rows.append(
+                f'<tr>'
+                f'<td style="padding:2px 6px;">'
+                f'<span style="display:inline-block;width:{int(20*w)}px;height:3px;'
+                f'background:{c};vertical-align:middle;{border}"></span>'
+                f'</td>'
+                f'<td style="padding:2px 6px;color:#ccc;font-size:11px;">{human}</td>'
+                f'</tr>'
+            )
+        legend_html = (
+            '<div style="background:#0d0d1a;border-radius:8px;padding:12px 16px;'
+            f'margin-top:8px;max-height:280px;overflow-y:auto;">'
+            f'<div style="color:#fff;font-size:13px;font-weight:bold;margin-bottom:6px;">'
+            f'Edge Colors ({len(used_rel_types)} relationship types)</div>'
+            f'<table style="border-collapse:collapse;">{"".join(legend_rows)}</table>'
+            f'</div>'
+        )
+        net.add_node(
+            "__legend__",
+            label="",
+            shape="dot",
+            size=0,
+            color="rgba(0,0,0,0)",
+            fixed=True,
+            x=-500,
+            y=-500,
+            physics=False,
+            title=legend_html,
+        )
+
+    try:
+        tmp_html = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.html', delete=False, encoding='utf-8'
+        )
+        tmp_path = tmp_html.name
+        net.write_html(tmp_path, notebook=False)
+        tmp_html.close()
+        with open(tmp_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        if use_abbreviated_labels and label_map:
+            label_map_json = json.dumps(label_map)
+            hidden_div = (
+                f'<div id="dendrite-label-map-data" style="display:none;">'
+                f'{label_map_json}</div>'
+            )
+            html_content = html_content.replace('</body>', hidden_div + '</body>')
+        os.unlink(tmp_path)
+    except Exception as e:
+        st.error(f"PyVis HTML generation failed: {e}")
+        html_content = net.generate_html()
+
+    custom_css = f"""
+<style>
+body {{
+    background: {theme['bg']};
+    margin: 0;
+    padding: 0;
+    font-family: '{node_font_face}', sans-serif;
+}}
+#mynetwork {{
+    border-radius: 16px;
+    box-shadow: 0 12px 48px {theme['shadow_color']};
+    outline: none;
+}}
+div.vis-tooltip {{
+    background: {theme['tooltip_bg']} !important;
+    color: {theme['tooltip_text']} !important;
+    border: 1px solid {theme['tooltip_border']} !important;
+    border-radius: 10px !important;
+    padding: 14px 18px !important;
+    font-family: '{node_font_face}', sans-serif !important;
+    font-size: {tooltip_font_size}px !important;
+    line-height: 1.5 !important;
+    box-shadow: 0 8px 32px {theme['shadow_color']} !important;
+    max-width: 320px !important;
+    white-space: normal !important;
+}}
+div.vis-network div.vis-manipulation {{
+    background: {theme['tooltip_bg']} !important;
+    border-top: 1px solid {theme['tooltip_border']} !important;
+    color: {theme['font']} !important;
+}}
+.dendrite-legend {{
+    font-size: {node_legend_font_size}px !important;
+}}
+</style>
+"""
+    html_content = html_content.replace('</head>', custom_css + '</head>')
+
+    if enable_node_highlight:
+        highlight_js = r"""
+<script>
+(function() {
+    var checkExist = setInterval(function() {
+        if (typeof network !== 'undefined' && network !== null && network.body && network.body.data) {
+            clearInterval(checkExist);
+            var nodesDS = network.body.data.nodes;
+            var edgesDS = network.body.data.edges;
+            var savedNodeColors = {};
+            var activeNodeId = null;
+            var labelMode = 'short';
+            var labelMap = {};
+            (function initLabelMap() {
+                var hidden = document.getElementById('dendrite-label-map-data');
+                if (hidden && hidden.textContent) {
+                    try { labelMap = JSON.parse(hidden.textContent); } catch(e) {}
+                }
+            })();
+            function resetAll() {
+                var nodeRestores = [];
+                for (var nid in savedNodeColors) {
+                    nodeRestores.push({id: nid, color: savedNodeColors[nid]});
+                }
+                if (nodeRestores.length > 0) nodesDS.update(nodeRestores);
+                savedNodeColors = {};
+                activeNodeId = null;
+                var panel = document.getElementById('edge-info-panel');
+                if (panel) panel.style.display = 'none';
+            }
+            function resolveFullName(shortOrId) {
+                if (labelMap && labelMap[shortOrId]) return labelMap[shortOrId];
+                var n = nodesDS.get(shortOrId);
+                if (n && n.title) {
+                    var htmlStr = n.title.replace(/<br\s*\/?>/gi, '\n');
+                    var tmp = document.createElement('div');
+                    tmp.innerHTML = htmlStr;
+                    var txt = (tmp.textContent || tmp.innerText || '').trim();
+                    var firstLine = txt.split('\n')[0];
+                    if (firstLine) return firstLine.replace(/<[^>]*>/g,'').trim();
+                }
+                return shortOrId;
+            }
+            function formatEdgeRow(e, idx, mode) {
+                var typeColor = e.inferred ? '#8b5cf6' : '#0ea5e9';
+                var badge = e.inferred ? ' <span style="background:#8b5cf6;color:white;padding:1px 4px;border-radius:3px;font-size:9px;">INFERRED</span>' : '';
+                var typeBadge = '<span style="background:rgba(14,165,233,0.1);color:#0ea5e9;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:600;">' + e.type + '</span>';
+                var fromName = (mode === 'short') ? e.from : resolveFullName(e.from);
+                var toName = (mode === 'short') ? e.to : resolveFullName(e.to);
+                return '<div style="padding:8px 10px;margin:4px 0;background:rgba(248,250,252,0.9);border-left:4px solid ' + typeColor + ';border-radius:6px;font-size:12px;">' +
+                    '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">' +
+                    '<span style="font-family:monospace;font-size:11px;color:#1e293b;font-weight:600;">' + fromName + '</span>' +
+                    '<span style="color:#94a3b8;font-size:13px;">↔</span>' +
+                    '<span style="font-family:monospace;font-size:11px;color:#1e293b;font-weight:600;">' + toName + '</span>' +
+                    '</div>' +
+                    '<div style="display:flex;align-items:center;gap:8px;padding-left:10px;">' +
+                    '<span style="background:#0ea5e9;color:white;font-size:10px;padding:2px 6px;border-radius:4px;font-weight:700;">W: ' + e.weight + '</span>' +
+                    typeBadge + badge +
+                    '</div></div>';
+            }
+            function showEdgeInfoPanel(nodeId, connectedEdges) {
+                var panel = document.getElementById('edge-info-panel');
+                if (!panel) {
+                    panel = document.createElement('div');
+                    panel.id = 'edge-info-panel';
+                    document.body.appendChild(panel);
+                }
+                panel.style.cssText = 'position:fixed;top:90px;right:20px;width:400px;max-height:calc(100vh - 110px);overflow-y:auto;z-index:9999;' +
+                    'background:rgba(255,255,255,0.95);border:1px solid rgba(255,215,0,0.6);border-radius:16px;padding:0;' +
+                    'font-family:Inter,Segoe UI,Roboto,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,0.15);backdrop-filter:blur(20px);';
+                var nodeData = nodesDS.get(nodeId);
+                var nodeName = nodeId;
+                var nodeDefinition = ""; var nodeType = ""; var nodeFreq = ""; var nodeDegree = "";
+                if (nodeData && nodeData.title) {
+                    var htmlStr = nodeData.title.replace(/<br\s*\/?>/gi, '\n');
+                    var tmpDiv = document.createElement("div");
+                    tmpDiv.innerHTML = htmlStr;
+                    var tooltipText = (tmpDiv.textContent || tmpDiv.innerText || "").trim();
+                    var defMatch = tooltipText.match(/Definition:\s*([^\n]+)/i);
+                    if (defMatch && defMatch[1]) { nodeDefinition = defMatch[1].trim(); }
+                    var typeMatch = tooltipText.match(/Type:\s*([^\n]+)/i);
+                    if (typeMatch && typeMatch[1]) { nodeType = typeMatch[1].trim(); }
+                    var freqMatch = tooltipText.match(/Frequency:\s*([^\n]+)/i);
+                    if (freqMatch && freqMatch[1]) { nodeFreq = freqMatch[1].trim(); }
+                    var degMatch = tooltipText.match(/Degree:\s*([^\n]+)/i);
+                    if (degMatch && degMatch[1]) { nodeDegree = degMatch[1].trim(); }
+                    var nameMatch = tooltipText.match(/^([^\n]+)/);
+                    if (nameMatch) nodeName = nameMatch[1].replace(/<[^>]*>/g,'').trim();
+                    if (!nodeName) nodeName = nodeId;
+                }
+                var html = '<div style="padding:16px 20px;background:linear-gradient(135deg,rgba(255,215,0,0.15),rgba(255,183,77,0.1));border-radius:16px 16px 0 0;border-bottom:2px solid rgba(255,215,0,0.4);">';
+                html += '<div style="font-size:18px;font-weight:800;color:#1e293b;margin-bottom:8px;">🧪 ' + nodeName + '</div>';
+                html += '<div style="display:flex;flex-wrap:wrap;gap:6px;">';
+                if (nodeType) html += '<span style="background:rgba(14,165,233,0.1);color:#0ea5e9;font-size:10px;padding:3px 8px;border-radius:10px;font-weight:600;">' + nodeType + '</span>';
+                if (nodeDegree) html += '<span style="background:rgba(168,85,247,0.1);color:#a855f7;font-size:10px;padding:3px 8px;border-radius:10px;font-weight:600;">Deg: ' + nodeDegree + '</span>';
+                if (nodeFreq) html += '<span style="background:rgba(34,197,94,0.1);color:#22c55e;font-size:10px;padding:3px 8px;border-radius:10px;font-weight:600;">Freq: ' + nodeFreq + '</span>';
+                html += '</div></div>';
+                if (nodeDefinition) {
+                    html += '<div style="padding:12px 20px;background:rgba(251,191,36,0.06);border-bottom:1px solid rgba(0,0,0,0.04);">';
+                    html += '<div style="font-size:10px;color:#94a3b8;font-weight:600;text-transform:uppercase;margin-bottom:4px;">📖 Definition</div>';
+                    html += '<div style="font-size:12px;color:#475569;font-style:italic;line-height:1.4;">' + nodeDefinition + '</div></div>';
+                }
+                html += '<div style="padding:10px 20px;background:rgba(248,250,252,0.8);border-bottom:1px solid rgba(0,0,0,0.04);display:flex;align-items:center;gap:10px;">';
+                html += '<span style="font-size:10px;color:#94a3b8;font-weight:600;">Label Mode</span>';
+                html += '<button id="btn-short" onclick="window._dendriteSetLabelMode(\'short\')" style="padding:4px 10px;border:none;border-radius:6px;font-size:10px;font-weight:700;cursor:pointer;background:#D32F2F;color:white;">Short</button>';
+                html += '<button id="btn-full" onclick="window._dendriteSetLabelMode(\'full\')" style="padding:4px 10px;border:none;border-radius:6px;font-size:10px;font-weight:700;cursor:pointer;background:transparent;color:#64748b;">Full</button>';
+                html += '</div>';
+                html += '<div id="edges-container" style="padding:12px 16px 16px;">';
+                var edgeList = [];
+                connectedEdges.forEach(function(eId) {
+                    var e = edgesDS.get(eId);
+                    if (!e) return;
+                    var fromNode = nodesDS.get(e.from); var toNode = nodesDS.get(e.to);
+                    var fromLabel = fromNode ? (fromNode.label || e.from) : e.from;
+                    var toLabel = toNode ? (toNode.label || e.to) : e.to;
+                    var w = (typeof e.value === 'number') ? e.value : (e.width || 1);
+                    var edgeType = 'unknown', isInferred = false;
+                    if (e.title) {
+                        var edgeHtml = e.title.replace(/<br\s*\/?>/gi, '\n');
+                        var tmpDiv = document.createElement('div');
+                        tmpDiv.innerHTML = edgeHtml;
+                        var _txt = (tmpDiv.textContent || tmpDiv.innerText || '').trim();
+                        var m = _txt.match(/Type:\s*([^\n]+)/);
+                        if (m) edgeType = m[1].trim();
+                        if (_txt.indexOf('Inferred: true') !== -1) isInferred = true;
+                    }
+                    edgeList.push({from: fromLabel, to: toLabel, weight: (typeof w === 'number') ? w.toFixed(2) : String(w), type: edgeType, inferred: isInferred});
+                });
+                edgeList.sort(function(a,b){ return parseFloat(b.weight)-parseFloat(a.weight); });
+                edgeList.forEach(function(e, idx){ html += formatEdgeRow(e, idx, labelMode); });
+                html += '</div>';
+                panel.innerHTML = html;
+                panel.style.display = 'block';
+                panel._edgeList = edgeList;
+                window._dendriteSetLabelMode = function(mode) {
+                    labelMode = mode;
+                    var p = document.getElementById('edge-info-panel');
+                    if (!p || !p._edgeList) return;
+                    var btnShort = document.getElementById('btn-short');
+                    var btnFull = document.getElementById('btn-full');
+                    if (mode === 'short') {
+                        btnShort.style.background = '#D32F2F'; btnShort.style.color = 'white';
+                        btnFull.style.background = 'transparent'; btnFull.style.color = '#64748b';
+                    } else {
+                        btnFull.style.background = '#D32F2F'; btnFull.style.color = 'white';
+                        btnShort.style.background = 'transparent'; btnShort.style.color = '#64748b';
+                    }
+                    var container = document.getElementById('edges-container');
+                    if (container) {
+                        var newHtml = '';
+                        p._edgeList.forEach(function(e, idx){ newHtml += formatEdgeRow(e, idx, mode); });
+                        container.innerHTML = newHtml;
+                    }
+                };
+            }
+            network.on("selectNode", function(params) {
+                var nodeId = params.nodes[0];
+                if (nodeId === "__legend__") {
+                    network.unselectAll();
+                    return;
+                }
+                if (activeNodeId !== null && activeNodeId !== nodeId) resetAll();
+                activeNodeId = nodeId;
+                var connectedEdges = network.getConnectedEdges(nodeId);
+                var connectedNodes = network.getConnectedNodes(nodeId);
+                var nodeUpdates = [];
+                connectedNodes.forEach(function(nId) {
+                    var n = nodesDS.get(nId);
+                    if (n && !savedNodeColors[nId]) {
+                        savedNodeColors[nId] = JSON.parse(JSON.stringify(n.color));
+                        var newColor = JSON.parse(JSON.stringify(n.color));
+                        if (typeof newColor === 'string') newColor = {background: newColor, border: '#FFD700'};
+                        else newColor.border = '#FFD700';
+                        nodeUpdates.push({id: nId, color: newColor, shadow: {enabled: true, color: 'rgba(255,215,0,0.5)', size: 15, x: 0, y: 0}});
+                    }
+                });
+                if (nodeUpdates.length > 0) nodesDS.update(nodeUpdates);
+                showEdgeInfoPanel(nodeId, connectedEdges);
+            });
+            network.on("deselectNode", function(){ resetAll(); });
+            network.on("click", function(params){
+                if (params.nodes.length === 0 && activeNodeId !== null) resetAll();
+            });
+        }
+    }, 250);
+})();
+</script>
+"""
+        html_content = html_content.replace('</body>', highlight_js + '</body>')
+
+    st.components.v1.html(html_content, height=790, scrolling=True)
+
+    if use_abbreviated_labels and label_map:
+        st.markdown("---")
+        st.markdown("### 🗺️ Node Label Legend")
+        st.caption("Hover over nodes in the interactive graph to see their full names and definitions.")
+        sorted_legend = sorted(label_map.items(), key=lambda x: int(x[0][1:]))
+        cols = st.columns(4)
+        for i, (short, full) in enumerate(sorted_legend):
+            with cols[i % 4]:
+                st.markdown(
+                    f"""<div class='dendrite-legend' style='padding:8px; border-radius:6px; background-color:{theme.get('tooltip_bg', '#f8fafc')};
+border-left:4px solid {theme.get('highlight_bg', '#ff6b6b')}; margin-bottom:6px; font-size:{node_legend_font_size}px;'>
+<b style='color:{theme.get('highlight_bg', '#ff6b6b')}; font-size:{node_legend_font_size+1}px;'>{short}</b>:
+<span style='font-size:{node_legend_font_size}px; color:{theme.get('font', '#1e293b')};'>{full}</span>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+
+    try:
+        html_bytes = html_content.encode('utf-8')
+        st.download_button(
+            "Download Interactive Graph (HTML)",
+            data=html_bytes,
+            file_name="dendrite_concept_graph.html",
+            mime="text/html",
+        )
+        del html_content, html_bytes
+        gc.collect()
+    except Exception as e:
+        st.error(f"Download preparation failed: {e}")
+
+
+def build_category_hierarchy(
+    concepts: List[str],
+    concept_abstract_map: Dict[str, List[int]],
+    top_n_per_category: int = 0,
+) -> Tuple[List[str], List[str], List[float]]:
+    labels: List[str] = []
+    parents: List[str] = []
+    values: List[float] = []
+
+    category_map = {c: categorize_dendrite_concept(c) for c in concepts}
+    all_cat_displays = set(cat.replace('_', ' ').title() for cat in category_map.values())
+
+    category_children: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    for concept in concepts:
+        cat = category_map.get(concept, 'general')
+        freq = len(concept_abstract_map.get(concept, []))
+        concept_display = concept.replace('_', ' ').title()
+        if concept_display in all_cat_displays:
+            continue
+        category_children[cat].append((concept, float(freq)))
+
+    total_value = sum(freq for children in category_children.values() for _, freq in children)
+    root_label = "Dendrite Growth"
+    labels.append(root_label)
+    parents.append("")
+    values.append(float(total_value))
+
+    for cat, children in sorted(category_children.items()):
+        cat_display = cat.replace('_', ' ').title()
+        labels.append(cat_display)
+        parents.append(root_label)
+        cat_total = sum(w for _, w in children)
+        values.append(float(cat_total))
+
+        children.sort(key=lambda x: x[1], reverse=True)
+        if top_n_per_category > 0:
+            children = children[:top_n_per_category]
+
+        for concept, freq in children:
+            concept_display = concept.replace('_', ' ').title()
+            labels.append(concept_display)
+            parents.append(cat_display)
+            values.append(float(freq))
+
+    return labels, parents, values
+
+
+def render_sunburst_chart(
+    labels, parents, values, cmap_name="viridis",
+    label_size=20, width=900, height=700,
+    theme=None, branchvalues="total",
+    show_labels=True, show_values=False,
+    hover_info="all", color_continuous_scale=None,
+    font_family="Arial, sans-serif",
+    legend_font_size=12,
+) -> None:
+    if not labels or len(labels) < 2:
+        st.info("Not enough categories for sunburst chart.")
+        return
+    if len(labels) != len(parents) or len(labels) != len(values):
+        st.error(f"Sunburst data mismatch: labels={len(labels)}, parents={len(parents)}, values={len(values)}")
+        return
+
+    if theme is None:
+        theme = THEME_PRESETS.get("Bright (Default)", THEME_PRESETS["Bright (Default)"])
+
+    parent_map = {labels[i]: parents[i] for i in range(len(labels))}
+
+    def get_depth(label, visited=None):
+        if visited is None:
+            visited = set()
+        if label in visited:
+            return 0
+        visited.add(label)
+        p = parent_map.get(label, "")
+        if p == "":
+            return 0
+        return 1 + get_depth(p, visited)
+
+    try:
+        depths = [get_depth(l) for l in labels]
+    except RecursionError:
+        st.error("Circular hierarchy detected in sunburst data.")
+        return
+
+    SYMBOL_LIBRARY = ['✦', '★', '●', '■', '▲', '◆', '⬟', '⬢', '◉', '◈',
+                      '◇', '○', '□', '△', '◊']
+
+    node_symbols: Dict[str, str] = {}
+    for i, lab in enumerate(labels):
+        d = depths[i]
+        p = parents[i]
+        if d == 0:
+            node_symbols[lab] = SYMBOL_LIBRARY[0]
+        else:
+            ancestors: List[str] = []
+            current = lab
+            visited: Set[str] = set()
+            while current != "" and current not in visited:
+                visited.add(current)
+                parent = parent_map.get(current, "")
+                if parent != "" and parent in node_symbols:
+                    ancestors.insert(0, node_symbols[parent])
+                current = parent
+            siblings = [
+                labels[j] for j in range(len(labels))
+                if parents[j] == p and depths[j] == d
+            ]
+            sym_idx = siblings.index(lab) if lab in siblings else 0
+            own_symbol = SYMBOL_LIBRARY[(d + sym_idx) % len(SYMBOL_LIBRARY)]
+            node_symbols[lab] = own_symbol
+
+    display_labels: List[str] = []
+    for i, lab in enumerate(labels):
+        d = depths[i]
+        if show_labels:
+            if d == 0:
+                display_labels.append(node_symbols[lab])
+            else:
+                chain: List[str] = []
+                current = lab
+                visited = set()
+                while current != "" and current not in visited:
+                    visited.add(current)
+                    if current in node_symbols:
+                        chain.insert(0, node_symbols[current])
+                    current = parent_map.get(current, "")
+                combo = "".join(chain[-3:]) if len(chain) > 3 else "".join(chain)
+                display_labels.append(combo)
+        else:
+            display_labels.append(lab)
+
+    unique_ids: List[str] = []
+    seen: Dict[str, int] = {}
+    for i, lab in enumerate(labels):
+        base = f"{lab}_d{depths[i]}"
+        if base in seen:
+            unique_ids.append(f"{base}_{seen[base]}")
+            seen[base] += 1
+        else:
+            unique_ids.append(base)
+            seen[base] = 1
+
+    parent_ids: List[str] = []
+    for p in parents:
+        if p == "":
+            parent_ids.append("")
+        else:
+            found = False
+            for i, lab in enumerate(labels):
+                if lab == p:
+                    parent_ids.append(unique_ids[i])
+                    found = True
+                    break
+            if not found:
+                parent_ids.append("")
+
+    n_nodes = len(labels)
+    cmap_to_use = color_continuous_scale or cmap_name or "Spectral"
+    plot_colors: List[str] = []
+
+    color_success = False
+    try:
+        cmap_obj = plt.cm.get_cmap(cmap_to_use)
+        t_vals = np.linspace(0.05, 0.95, n_nodes)
+        rgbas = [cmap_obj(t) for t in t_vals]
+        plot_colors = [matplotlib.colors.to_hex(rgba) for rgba in rgbas]
+        color_success = True
+    except Exception:
+        pass
+
+    if not color_success:
+        try:
+            if hasattr(px.colors.sequential, cmap_to_use):
+                px_scale = getattr(px.colors.sequential, cmap_to_use)
+                plot_colors = [
+                    px_scale[int(i * len(px_scale) / n_nodes) % len(px_scale)]
+                    for i in range(n_nodes)
+                ]
+                color_success = True
+        except Exception:
+            pass
+
+    if not color_success:
+        try:
+            from plotly.express import colors as px_colors
+            qual_palettes = [
+                px_colors.qualitative.Bold,
+                px_colors.qualitative.Vivid,
+                px_colors.qualitative.Safe,
+                px_colors.qualitative.Pastel,
+                px_colors.qualitative.Dark24,
+                px_colors.qualitative.Light24,
+            ]
+            long_palette: List[str] = []
+            for pal in qual_palettes:
+                long_palette.extend(pal)
+            plot_colors = [
+                long_palette[i % len(long_palette)] for i in range(n_nodes)
+            ]
+            color_success = True
+        except Exception:
+            pass
+
+    if not color_success:
+        cmap_obj = plt.cm.get_cmap("tab20")
+        plot_colors = [
+            matplotlib.colors.to_hex(cmap_obj(i % 20 / 20))
+            for i in range(n_nodes)
+        ]
+
+    legend_entries: List[Dict[str, Any]] = []
+    for i, lab in enumerate(labels):
+        d = depths[i]
+        sym = display_labels[i]
+        color = plot_colors[i]
+        legend_entries.append({
+            'symbol': sym,
+            'label': lab,
+            'depth': d,
+            'color': color,
+            'value': values[i],
+        })
+    legend_entries.sort(key=lambda x: (x['depth'], -x['value']))
+
+    bv = branchvalues if branchvalues in ["total", "remainder"] else "total"
+    if show_labels and show_values:
+        textinfo = 'label+value'
+    elif show_labels:
+        textinfo = 'label'
+    elif show_values:
+        textinfo = 'value'
+    else:
+        textinfo = 'none'
+
+    sunburst_colors = plot_colors.copy()
+    for i in range(len(labels)):
+        if depths[i] == 0:
+            sunburst_colors[i] = theme.get("plotly_paper", "#f8f9fa")
+
+    try:
+        fig = go.Figure(go.Sunburst(
+            ids=unique_ids,
+            labels=display_labels,
+            parents=parent_ids,
+            values=values,
+            customdata=labels,
+            branchvalues=bv,
+            marker=dict(
+                colors=sunburst_colors,
+                line=dict(width=0.5, color="rgba(255,255,255,0.25)"),
+            ),
+            textinfo=textinfo,
+            hovertemplate=(
+                '<b>%{customdata}</b><br>Value: %{value}<br>'
+                'Symbol: %{label}<extra></extra>'
+                if hover_info == "all"
+                else '<b>%{customdata}</b><extra></extra>'
+                if hover_info == "minimal"
+                else '<extra></extra>'
+            ),
+            insidetextorientation="radial",
+            textfont=dict(
+                size=int(label_size), family=font_family, color="white"
+            ),
+        ))
+    except Exception as e:
+        st.error(f"Failed to create sunburst chart: {e}")
+        return
+
+    try:
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=80, b=0),
+            paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+            font=dict(color=theme.get("font", "#000000"), family=font_family),
+            width=int(width),
+            height=int(height),
+            title=dict(
+                text=(
+                    "<b>Hierarchical Concept Map</b><br>"
+                    "<sup>★ Parent | ★□ Child | ★□◆ Grandchild — Hover for names</sup>"
+                ),
+                font=dict(size=16, family=font_family),
+            ),
+            modebar=dict(
+                orientation='h',
+                bgcolor='rgba(255,255,255,0.7)',
+                color='#333333',
+                activecolor='#D32F2F',
+            ),
+        )
+    except Exception as e:
+        st.warning(f"Layout configuration issue: {e}")
+
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "💡 **Export:** Click the 📷 Camera icon (top-right of chart) "
+        "to download high-res PNG/SVG/PDF."
+    )
+
+    if st.session_state.get('sunburst_show_legend', True):
+        st.markdown("### 📊 Symbol-to-Label Legend")
+        depth_names = {
+            0: "Root", 1: "Category (Parent)", 2: "Concept (Child)",
+            3: "Sub-Concept", 4: "Detail",
+        }
+        for d in sorted(set([e['depth'] for e in legend_entries])):
+            depth_label = depth_names.get(d, f"Level {d}")
+            st.markdown(f"**{depth_label}**")
+            entries_at_depth = [
+                e for e in legend_entries if e['depth'] == d
+            ]
+            n_cols = min(4, max(1, len(entries_at_depth)))
+            cols = st.columns(n_cols)
+            for i, entry in enumerate(entries_at_depth):
+                with cols[i % n_cols]:
+                    text_color = theme.get("font", "#333333")
+                    st.markdown(
+                        f"""<div style='padding:8px; border-radius:6px; background-color:{entry['color']}22;
+border-left:4px solid {entry['color']}; margin-bottom:6px; font-size:{legend_font_size}px;'>
+<span style='font-size:{legend_font_size+4}px; color:{entry['color']}; margin-right:6px;'>{entry['symbol']}</span>
+<span style='font-size:{legend_font_size}px; color:{text_color}; font-weight:500;'>{entry['label']}</span>
+<span style='font-size:{legend_font_size-1}px; color:#666; float:right;'>({entry['value']:.0f})</span>
+</div>""",
+                        unsafe_allow_html=True,
+                    )
+
+
+def render_graph_plotly_2d(
+    nx_graph, concept_abstract_map,
+    cmap_name="viridis", top_n_nodes=0, theme=None,
+    show_edge_weights=False, node_label_size=10,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if top_n_nodes > 0 and len(nx_graph.nodes()) > top_n_nodes:
+        degrees = dict(nx_graph.degree(weight='weight'))
+        top_nodes = sorted(degrees.keys(), key=lambda x: degrees[x], reverse=True)[:top_n_nodes]
+        nx_graph = nx_graph.subgraph(top_nodes).copy()
+
+    if nx_graph.number_of_nodes() == 0:
+        st.info("No nodes to display in 2D plot.")
+        return
+
+    try:
+        pos = nx.spring_layout(nx_graph, seed=42, k=2.5, iterations=100)
+    except Exception:
+        pos = {n: (0, 0) for n in nx_graph.nodes()}
+
+    edge_x, edge_y = [], []
+    for u, v in nx_graph.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    node_x, node_y, node_text, node_color, node_size = [], [], [], [], []
+    cmap_colors = get_colormap_colors(cmap_name, max(1, len(nx_graph.nodes())))
+    for i, node in enumerate(nx_graph.nodes()):
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        freq = len(concept_abstract_map.get(node, []))
+        node_text.append(f"{node}<br>Freq: {freq}")
+        node_color.append(get_dendrite_category_color(node, cmap_colors))
+        node_size.append(max(15, min(50, freq + 10)))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=edge_x, y=edge_y, mode='lines',
+        line=dict(color='rgba(150,150,150,0.4)', width=1),
+        hoverinfo='none'
+    ))
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y, mode='markers+text',
+        marker=dict(size=node_size, color=node_color, line=dict(width=1, color='white')),
+        text=[n.replace('_', ' ').title() for n in nx_graph.nodes()],
+        textposition='top center',
+        textfont=dict(size=node_label_size, color=theme.get('font', '#000')),
+        hovertext=node_text,
+        hoverinfo='text'
+    ))
+    fig.update_layout(
+        showlegend=False,
+        paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+        plot_bgcolor=theme.get('plotly_bg', '#ffffff'),
+        font_color=theme.get('font', '#000000'),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        title="2D Concept Graph (Plotly)",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_graph_plotly_3d(
+    nx_graph, concept_abstract_map,
+    cmap_name="viridis", top_n_nodes=0, theme=None,
+    show_edge_weights=False,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if top_n_nodes > 0 and len(nx_graph.nodes()) > top_n_nodes:
+        degrees = dict(nx_graph.degree(weight='weight'))
+        top_nodes = sorted(degrees.keys(), key=lambda x: degrees[x], reverse=True)[:top_n_nodes]
+        nx_graph = nx_graph.subgraph(top_nodes).copy()
+
+    if nx_graph.number_of_nodes() == 0:
+        st.info("No nodes to display in 3D plot.")
+        return
+
+    try:
+        pos = nx.spring_layout(nx_graph, seed=42, dim=3, k=2.5, iterations=100)
+    except Exception:
+        pos = {n: (0, 0, 0) for n in nx_graph.nodes()}
+
+    edge_x, edge_y, edge_z = [], [], []
+    for u, v in nx_graph.edges():
+        x0, y0, z0 = pos[u]
+        x1, y1, z1 = pos[v]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+        edge_z.extend([z0, z1, None])
+
+    node_x, node_y, node_z, node_text, node_color, node_size = [], [], [], [], [], []
+    cmap_colors = get_colormap_colors(cmap_name, max(1, len(nx_graph.nodes())))
+    for node in nx_graph.nodes():
+        x, y, z = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        node_z.append(z)
+        freq = len(concept_abstract_map.get(node, []))
+        node_text.append(f"{node}<br>Freq: {freq}")
+        node_color.append(get_dendrite_category_color(node, cmap_colors))
+        node_size.append(max(8, min(25, freq // 2 + 5)))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(
+        x=edge_x, y=edge_y, z=edge_z, mode='lines',
+        line=dict(color='rgba(150,150,150,0.3)', width=1),
+        hoverinfo='none'
+    ))
+    fig.add_trace(go.Scatter3d(
+        x=node_x, y=node_y, z=node_z, mode='markers+text',
+        marker=dict(size=node_size, color=node_color, line=dict(width=1, color='white')),
+        text=[n.replace('_', ' ').title() for n in nx_graph.nodes()],
+        textposition='top center',
+        textfont=dict(size=8, color=theme.get('font', '#000')),
+        hovertext=node_text,
+        hoverinfo='text'
+    ))
+    fig.update_layout(
+        showlegend=False,
+        paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+        scene=dict(
+            xaxis=dict(showgrid=False, showticklabels=False, title=''),
+            yaxis=dict(showgrid=False, showticklabels=False, title=''),
+            zaxis=dict(showgrid=False, showticklabels=False, title=''),
+        ),
+        title="3D Concept Graph (Plotly)",
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_graph_fallback(
+    nx_graph, concept_abstract_map,
+    theme=None, show_edge_weights=False,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    st.info("Text-based graph summary (fallback mode)")
+
+    st.markdown(f"**Nodes:** {nx_graph.number_of_nodes()}")
+    st.markdown(f"**Edges:** {nx_graph.number_of_edges()}")
+
+    top_nodes = sorted(
+        nx_graph.nodes(),
+        key=lambda n: len(concept_abstract_map.get(n, [])),
+        reverse=True,
+    )[:20]
+
+    node_data = []
+    for node in top_nodes:
+        freq = len(concept_abstract_map.get(node, []))
+        degree = nx_graph.degree(node)
+        node_data.append({
+            'Concept': node.replace('_', ' ').title(),
+            'Frequency': freq,
+            'Degree': degree,
+            'Category': categorize_dendrite_concept(node),
+        })
+
+    st.dataframe(pd.DataFrame(node_data), width="stretch")
+
+
+def render_radar_chart(
+    distill_df, top_k=15, cmap_name="viridis", theme=None,
+    label_size=12, font_size=11
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if distill_df.empty:
+        st.info("No distillation data for radar chart.")
+        return
+
+    df = distill_df.head(top_k).copy()
+    if len(df) < 3:
+        st.info("Need at least 3 concepts for radar chart.")
+        return
+
+    categories = df['concept'].tolist()
+    categories = [c.replace('_', ' ').title() for c in categories]
+    cmap_colors = get_colormap_colors(cmap_name, 3)
+
+    fig = go.Figure()
+    metrics_to_plot = [
+        ('frequency', 'Frequency'),
+        ('semantic_density', 'Semantic Density'),
+        ('coherence_score', 'Coherence')
+    ]
+
+    for i, (metric, name) in enumerate(metrics_to_plot):
+        if metric in df.columns:
+            values = df[metric].tolist()
+            values += values[:1]
+            cat_loop = categories + categories[:1]
+            fig.add_trace(go.Scatterpolar(
+                r=values, theta=cat_loop,
+                fill='toself', name=name,
+                line=dict(color=cmap_colors[i], width=2),
+            ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True, range=[0, 1.1],
+                tickfont=dict(size=int(font_size), color=theme.get('axis_color', '#000'))
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=int(label_size), color=theme.get('font', '#000'))
+            )
+        ),
+        showlegend=True,
+        title=f"Concept Distillation Radar (Top {min(top_k, 10)})",
+        paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+        font=dict(color=theme.get('font', '#000000'), size=int(font_size)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=int(font_size))),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_tsne_projection(
+    valid_concepts, concept_abstract_map,
+    embed_model, theme=None,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if len(valid_concepts) < 5:
+        st.info("Need at least 5 concepts for t-SNE projection.")
+        return
+
+    try:
+        with torch.no_grad():
+            embeddings = embed_model.encode(
+                valid_concepts, show_progress_bar=False,
+                batch_size=64, convert_to_numpy=True,
+            )
+        from sklearn.manifold import TSNE
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(valid_concepts)-1))
+        coords = tsne.fit_transform(embeddings)
+
+        freqs = [len(concept_abstract_map.get(c, [])) for c in valid_concepts]
+        categories = [categorize_dendrite_concept(c) for c in valid_concepts]
+
+        fig = px.scatter(
+            x=coords[:, 0], y=coords[:, 1],
+            color=categories,
+            size=freqs,
+            hover_name=[c.replace('_', ' ').title() for c in valid_concepts],
+            title="t-SNE Projection of Concept Embeddings",
+            template="plotly_white" if theme == THEME_PRESETS["Bright (Default)"] else "plotly_dark",
+        )
+        fig.update_layout(
+            paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+            plot_bgcolor=theme.get('plotly_bg', '#ffffff'),
+            font_color=theme.get('font', '#000000'),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+        del embeddings, coords
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        st.warning(f"t-SNE projection failed: {e}")
+
+
+def render_community_detection(
+    nx_graph, valid_concepts,
+    concept_abstract_map, theme=None,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if nx_graph.number_of_nodes() < 5:
+        st.info("Need at least 5 nodes for community detection.")
+        return
+
+    try:
+        from networkx.algorithms import community
+        communities = list(community.greedy_modularity_communities(nx_graph))
+
+        node_community = {}
+        for i, comm in enumerate(communities):
+            for node in comm:
+                node_community[node] = f"Community {i+1}"
+
+        comm_data = []
+        for node in valid_concepts:
+            if node in node_community:
+                comm_data.append({
+                    'Concept': node.replace('_', ' ').title(),
+                    'Community': node_community[node],
+                    'Frequency': len(concept_abstract_map.get(node, [])),
+                    'Degree': nx_graph.degree(node),
+                })
+
+        if comm_data:
+            comm_df = pd.DataFrame(comm_data)
+            st.dataframe(comm_df, width="stretch")
+
+            fig = px.scatter(
+                comm_df, x='Degree', y='Frequency',
+                color='Community', hover_data=['Concept'],
+                title="Communities by Degree vs Frequency",
+                template="plotly_white" if theme == THEME_PRESETS["Bright (Default)"] else "plotly_dark",
+            )
+            fig.update_layout(
+                paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+                plot_bgcolor=theme.get('plotly_bg', '#ffffff'),
+                font_color=theme.get('font', '#000000'),
+            )
+            st.plotly_chart(fig, width="stretch")
+    except Exception as e:
+        st.warning(f"Community detection failed: {e}")
+
+
+def render_concept_growth(
+    df_filtered, valid_concepts,
+    concept_abstract_map, theme=None,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if "Year" not in df_filtered.columns or df_filtered["Year"].isna().all():
+        st.info("No year data available for growth analysis.")
+        return
+
+    years = df_filtered["Year"].dropna().astype(int)
+    if len(years.unique()) < 2:
+        st.info("Need at least 2 years for growth analysis.")
+        return
+
+    year_range = sorted(years.unique())
+    top_concepts = sorted(
+        valid_concepts,
+        key=lambda c: len(concept_abstract_map.get(c, [])),
+        reverse=True,
+    )[:10]
+
+    growth_data = []
+    for year in year_range:
+        year_mask = df_filtered["Year"] == year
+        year_df = df_filtered[year_mask]
+        year_text = ""
+        for idx, row in year_df.iterrows():
+            for col in df_filtered.columns:
+                if pd.notna(row[col]):
+                    year_text += " " + str(row[col])
+        for concept in top_concepts:
+            count = len(re.findall(r'\b' + re.escape(concept) + r'\b', year_text, re.I))
+            growth_data.append({"Year": year, "Concept": concept, "Count": count})
+
+    if growth_data:
+        growth_df = pd.DataFrame(growth_data)
+        fig = px.line(
+            growth_df, x="Year", y="Count", color="Concept",
+            title="Concept Growth Over Time",
+            template="plotly_white" if theme == THEME_PRESETS["Bright (Default)"] else "plotly_dark",
+        )
+        fig.update_layout(
+            paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+            plot_bgcolor=theme.get('plotly_bg', '#ffffff'),
+            font_color=theme.get('font', '#000000'),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+
+def render_bubble_chart(
+    nx_graph, valid_concepts,
+    concept_abstract_map, distill_df, theme=None,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if nx_graph.number_of_nodes() == 0:
+        st.info("No graph data for bubble chart.")
+        return
+
+    bubble_data = []
+    for concept in valid_concepts:
+        freq = len(concept_abstract_map.get(concept, []))
+        degree = nx_graph.degree(concept)
+        category = categorize_dendrite_concept(concept)
+
+        efficiency = 0.0
+        if not distill_df.empty and 'concept' in distill_df.columns:
+            match = distill_df[distill_df['concept'] == concept]
+            if not match.empty and 'distillation_efficiency' in match.columns:
+                efficiency = match['distillation_efficiency'].values[0]
+
+        bubble_data.append({
+            'Concept': concept.replace('_', ' ').title(),
+            'Frequency': freq,
+            'Degree': degree,
+            'Category': category,
+            'Efficiency': efficiency,
+        })
+
+    if bubble_data:
+        bubble_df = pd.DataFrame(bubble_data)
+        fig = px.scatter(
+            bubble_df, x='Degree', y='Frequency',
+            size='Efficiency', color='Category',
+            hover_name='Concept',
+            title="Concept Importance Bubble Chart",
+            size_max=50,
+            template="plotly_white" if theme == THEME_PRESETS["Bright (Default)"] else "plotly_dark",
+        )
+        fig.update_layout(
+            paper_bgcolor=theme.get('plotly_paper', '#ffffff'),
+            plot_bgcolor=theme.get('plotly_bg', '#ffffff'),
+            font_color=theme.get('font', '#000000'),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+
+def apply_graph_edits(
+    nx_graph, valid_concepts, concept_to_id, id_to_concept,
+    concept_abstract_map,
+    nodes_to_remove=None, nodes_to_merge=None, merge_name=None,
+    new_edge=None, new_edge_weight=1.0,
+    min_degree=0, min_freq=0,
+) -> Tuple[nx.Graph, List[str], Dict[str, int], Dict[int, str], Dict[str, List[int]], bool]:
+    edited = False
+
+    if nodes_to_remove:
+        for node in nodes_to_remove:
+            if node in nx_graph:
+                nx_graph.remove_node(node)
+                edited = True
+        valid_concepts = [c for c in valid_concepts if c not in nodes_to_remove]
+
+    if nodes_to_merge and merge_name and len(nodes_to_merge) >= 2:
+        merged_freq = sum(len(concept_abstract_map.get(c, [])) for c in nodes_to_merge)
+        nx_graph.add_node(merge_name, frequency=merged_freq, concept_type='general')
+
+        for node in nodes_to_merge:
+            if node in nx_graph:
+                for neighbor in list(nx_graph.neighbors(node)):
+                    if neighbor not in nodes_to_merge and neighbor != merge_name:
+                        if not nx_graph.has_edge(merge_name, neighbor):
+                            nx_graph.add_edge(merge_name, neighbor, weight=1.0)
+                nx_graph.remove_node(node)
+
+        valid_concepts = [c for c in valid_concepts if c not in nodes_to_merge]
+        if merge_name not in valid_concepts:
+            valid_concepts.append(merge_name)
+        edited = True
+
+    if new_edge and len(new_edge) == 2:
+        u, v = new_edge
+        if u in nx_graph and v in nx_graph and u != v:
+            nx_graph.add_edge(u, v, weight=float(new_edge_weight), cooccurrence=0, semantic=0, edge_type='manual')
+            edited = True
+
+    if min_degree > 0:
+        low_degree = [n for n in nx_graph.nodes() if nx_graph.degree(n) < min_degree]
+        for node in low_degree:
+            nx_graph.remove_node(node)
+        valid_concepts = [c for c in valid_concepts if c in nx_graph]
+        if low_degree:
+            edited = True
+
+    if min_freq > 0:
+        low_freq = [n for n in nx_graph.nodes() if len(concept_abstract_map.get(n, [])) < min_freq]
+        for node in low_freq:
+            nx_graph.remove_node(node)
+        valid_concepts = [c for c in valid_concepts if c in nx_graph]
+        if low_freq:
+            edited = True
+
+    concept_to_id = {c: i for i, c in enumerate(valid_concepts)}
+    id_to_concept = {i: c for i, c in enumerate(valid_concepts)}
+
+    return nx_graph, valid_concepts, concept_to_id, id_to_concept, concept_abstract_map, edited
+
+
+def render_concept_timeline(
+    df_filtered, valid_concepts, concept_abstract_map, theme=None,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    if "Year" not in df_filtered.columns or df_filtered["Year"].isna().all():
+        st.info("No 'Year' data available for timeline visualization.")
+        return
+    years = df_filtered["Year"].dropna().astype(int)
+    if len(years) == 0:
+        st.info("No valid year data found.")
+        return
+    year_range = sorted(years.unique())
+    if len(year_range) < 2:
+        st.info("Need at least 2 different years for timeline.")
+        return
+    top_concepts = sorted(
+        valid_concepts,
+        key=lambda c: len(concept_abstract_map.get(c, [])),
+        reverse=True,
+    )[:10]
+    timeline_data: List[Dict[str, Any]] = []
+    for year in year_range:
+        year_mask = df_filtered["Year"] == year
+        year_df = df_filtered[year_mask]
+        year_text = ""
+        for idx, row in year_df.iterrows():
+            for col in df_filtered.columns:
+                if pd.notna(row[col]):
+                    year_text += " " + str(row[col])
+        for concept in top_concepts:
+            count = len(re.findall(
+                r'\b' + re.escape(concept) + r'\b', year_text, re.I
+            ))
+            timeline_data.append({
+                "Year": year, "Concept": concept, "Count": count,
+            })
+    if not timeline_data:
+        st.info("No timeline data to display.")
+        return
+    timeline_df = pd.DataFrame(timeline_data)
+    fig = px.line(
+        timeline_df, x="Year", y="Count", color="Concept",
+        title="Concept Frequency Over Time",
+        labels={"Count": "Mentions", "Year": "Publication Year"},
+        template=(
+            "plotly_white" if theme == THEME_PRESETS["Bright (Default)"]
+            else "plotly_dark"
+        ),
+    )
+    fig.update_layout(
+        paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+        plot_bgcolor=theme.get("plotly_bg", "#ffffff"),
+        font_color=theme.get("font", "#000000"),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_cooccurrence_heatmap(
+    nx_graph, valid_concepts, concept_abstract_map,
+    top_n=30, theme=None,
+) -> None:
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    top_concepts = sorted(
+        valid_concepts,
+        key=lambda c: len(concept_abstract_map.get(c, [])),
+        reverse=True,
+    )[:top_n]
+    if len(top_concepts) < 3:
+        st.info("Need at least 3 concepts for heatmap.")
+        return
+    n = len(top_concepts)
+    matrix = np.zeros((n, n))
+    for i, c1 in enumerate(top_concepts):
+        for j, c2 in enumerate(top_concepts):
+            if i == j:
+                matrix[i][j] = len(concept_abstract_map.get(c1, []))
+            elif nx_graph.has_edge(c1, c2):
+                matrix[i][j] = nx_graph[c1][c2].get('cooccurrence', 0)
+    fig = px.imshow(
+        matrix, x=top_concepts, y=top_concepts,
+        labels=dict(x="Concept", y="Concept", color="Co-occurrence"),
+        title=f"Co-occurrence Heatmap (Top {n} Concepts)",
+        color_continuous_scale="Viridis",
+    )
+    fig.update_layout(
+        paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+        font_color=theme.get("font", "#000000"),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+# ============================================================================
+# EXPORT FUNCTIONS
+# ============================================================================
+def export_graph(
+    nx_graph, concept_abstract_map, export_format: str,
+    include_metadata: bool = True,
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    if export_format == "GraphML":
+        try:
+            if include_metadata:
+                nx_graph.graph['created'] = datetime.now().isoformat()
+                nx_graph.graph['version'] = '6.1'
+                nx_graph.graph['tool'] = 'Battery-ConceptGraph'
+            try:
+                nx.write_graphml_lxml(nx_graph, "dendrite_graph.graphml")
+            except Exception:
+                nx.write_graphml(nx_graph, "dendrite_graph.graphml")
+            with open("dendrite_graph.graphml", "rb") as f:
+                return f.read(), "application/graphml+xml", "dendrite_graph.graphml"
+        except Exception as e:
+            st.error(f"GraphML export failed: {e}")
+            return None, None, None
+    elif export_format == "JSON (Full Metadata)":
+        data = nx.node_link_data(nx_graph)
+        if include_metadata:
+            data['metadata'] = {
+                'created': datetime.now().isoformat(),
+                'version': '6.1',
+                'tool': 'Battery-ConceptGraph',
+                'node_count': len(nx_graph.nodes()),
+                'edge_count': len(nx_graph.edges()),
+                'inferred_edges': sum(
+                    1 for u, v, d in nx_graph.edges(data=True)
+                    if d.get('inferred', False)
+                ),
+                'categories': list(set(
+                    categorize_dendrite_concept(c) for c in nx_graph.nodes()
+                )),
+            }
+        json_str = json.dumps(data, indent=2, default=str)
+        return json_str.encode('utf-8'), "application/json", "dendrite_graph_full.json"
+    elif export_format == "JSON (Compact)":
+        data = nx.node_link_data(nx_graph)
+        json_str = json.dumps(data, indent=2, default=str)
+        return json_str.encode('utf-8'), "application/json", "dendrite_graph.json"
+    elif export_format == "CSV (Edges + Metadata)":
+        edge_data: List[Dict[str, Any]] = []
+        for u, v, data in nx_graph.edges(data=True):
+            row = {
+                "source": u, "target": v,
+                "weight": data.get('weight', 1),
+                "cooccurrence": data.get('cooccurrence', 0),
+                "semantic_similarity": data.get('semantic', 0),
+                "edge_type": data.get('edge_type', 'unknown'),
+                "inferred": data.get('inferred', False),
+                "confidence": data.get('confidence', 1.0),
+                "path": data.get('path', ''),
+            }
+            edge_data.append(row)
+        csv_df = pd.DataFrame(edge_data)
+        return csv_df.to_csv(index=False).encode('utf-8'), "text/csv", "dendrite_edges_enhanced.csv"
+    elif export_format == "CSV (Nodes + Metadata)":
+        node_data: List[Dict[str, Any]] = []
+        for node in nx_graph.nodes():
+            row = {
+                "concept": node,
+                "frequency": len(concept_abstract_map.get(node, [])),
+                "degree": nx_graph.degree(node),
+                "concept_type": nx_graph.nodes[node].get('concept_type', 'general'),
+                "definition": nx_graph.nodes[node].get('definition', ''),
+                "category": categorize_dendrite_concept(node),
+            }
+            row.update({
+                k: v for k, v in nx_graph.nodes[node].items()
+                if isinstance(v, (str, int, float, bool))
+            })
+            node_data.append(row)
+        csv_df = pd.DataFrame(node_data)
+        return csv_df.to_csv(index=False).encode('utf-8'), "text/csv", "dendrite_nodes_enhanced.csv"
+    elif export_format == "PNG":
+        try:
+            pos = nx.spring_layout(nx_graph, seed=42)
+            plt.figure(figsize=(14, 12), dpi=300)
+            node_colors = [
+                get_dendrite_category_color(n) for n in nx_graph.nodes()
+            ]
+            nx.draw(
+                nx_graph, pos, with_labels=True,
+                node_color=node_colors, edge_color='gray',
+                node_size=400, font_size=7, font_weight='bold',
+                edgecolors='white', linewidths=1,
+            )
+            buf = io.BytesIO()
+            plt.savefig(
+                buf, format='png', dpi=300,
+                bbox_inches='tight', facecolor='white',
+            )
+            buf.seek(0)
+            plt.close()
+            return buf.read(), "image/png", "dendrite_graph.png"
+        except Exception as e:
+            st.error(f"PNG export failed: {e}")
+            return None, None, None
+    elif export_format == "SVG":
+        try:
+            pos = nx.spring_layout(nx_graph, seed=42)
+            plt.figure(figsize=(14, 12), dpi=150)
+            node_colors = [
+                get_dendrite_category_color(n) for n in nx_graph.nodes()
+            ]
+            nx.draw(
+                nx_graph, pos, with_labels=True,
+                node_color=node_colors, edge_color='gray',
+                node_size=400, font_size=7, font_weight='bold',
+                edgecolors='white', linewidths=1,
+            )
+            buf = io.BytesIO()
+            plt.savefig(
+                buf, format='svg', bbox_inches='tight', facecolor='white',
+            )
+            buf.seek(0)
+            plt.close()
+            return buf.read(), "image/svg+xml", "dendrite_graph.svg"
+        except Exception as e:
+            st.error(f"SVG export failed: {e}")
+            return None, None, None
+    elif export_format == "GEXF":
+        try:
+            if include_metadata:
+                nx_graph.graph['created'] = datetime.now().isoformat()
+                nx_graph.graph['version'] = '6.1'
+            nx.write_gexf(nx_graph, "dendrite_graph.gexf")
+            with open("dendrite_graph.gexf", "rb") as f:
+                return f.read(), "application/xml", "dendrite_graph.gexf"
+        except Exception as e:
+            st.error(f"GEXF export failed: {e}")
+            return None, None, None
+    return None, None, None
+
+
+# ============================================================================
+# REASONING DASHBOARD
+# ============================================================================
+def render_reasoning_dashboard(
+    nx_graph, valid_concepts, ontology, extractor,
+) -> None:
+    st.subheader("🔍 Ontology-Based Reasoning Insights")
+    type_counts: Dict[str, int] = defaultdict(int)
+    for c in valid_concepts:
+        if c in ontology.concepts:
+            type_counts[ontology.concepts[c].concept_type.value] += 1
+        else:
+            type_counts["unknown"] += 1
+    fig = px.pie(
+        values=list(type_counts.values()),
+        names=list(type_counts.keys()),
+        title="Concept Type Distribution",
+    )
+    st.plotly_chart(fig, width="stretch")
+    inferred_edges = [
+        (u, v) for u, v, d in nx_graph.edges(data=True)
+        if d.get('inferred', False)
+    ]
+    observed_edges = [
+        (u, v) for u, v, d in nx_graph.edges(data=True)
+        if not d.get('inferred', False)
+    ]
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Observed Edges", len(observed_edges))
+    col2.metric("Inferred Edges", len(inferred_edges))
+    col3.metric(
+        "Inference Ratio",
+        f"{len(inferred_edges) / max(len(observed_edges), 1):.2f}",
+    )
+    rel_types: Dict[str, int] = defaultdict(int)
+    for u, v, d in nx_graph.edges(data=True):
+        rel_types[d.get('edge_type', 'unknown')] += 1
+    if rel_types:
+        rel_df = pd.DataFrame(
+            [(k, v) for k, v in rel_types.items()],
+            columns=['Relationship Type', 'Count'],
+        )
+        rel_df = rel_df.sort_values('Count', ascending=False)
+        st.dataframe(rel_df, width="stretch")
+        fig = px.bar(
+            rel_df, x='Relationship Type', y='Count',
+            title="Edge Type Distribution",
+            color='Relationship Type',
+        )
+        st.plotly_chart(fig, width="stretch")
+    st.subheader("🔗 Inferred Method-Property Chains")
+    method_nodes = [
+        c for c in valid_concepts
+        if c in ontology.concepts
+        and ontology.concepts[c].concept_type == ConceptType.METHOD
+    ]
+    property_nodes = [
+        c for c in valid_concepts
+        if c in ontology.concepts
+        and ontology.concepts[c].concept_type == ConceptType.PROPERTY
+    ]
+    chains_found: List[Dict[str, Any]] = []
+    for method in method_nodes[:5]:
+        for prop in property_nodes[:5]:
+            paths = ontology.infer_path(method, prop, max_depth=3)
+            if paths:
+                chains_found.append({
+                    "Method": method,
+                    "Property": prop,
+                    "Path Length": len(paths[0]),
+                    "Path": " → ".join(paths[0]),
+                })
+    if chains_found:
+        st.dataframe(pd.DataFrame(chains_found), width="stretch")
+    else:
+        st.info("No direct inference chains found. Build graph with more concepts.")
+    st.subheader("📚 Synonym Resolution Examples")
+    synonym_examples = [
+        ("modulus", "youngs_modulus"),
+        ("vm stress", "von_mises_stress"),
+        ("s/l ratio", "solid_liquid_ratio"),
+        ("llzo", "llzo_solid_electrolyte"),
+        ("phi", "order_parameter_phi"),
+    ]
+    syn_data: List[Dict[str, Any]] = []
+    for original, expected in synonym_examples:
+        resolved = ontology.resolve_concept(original)
+        syn_data.append({
+            "Original": original,
+            "Expected": expected,
+            "Resolved": resolved,
+            "Match": (
+                "✅" if resolved == expected
+                else ("⚠️" if resolved else "❌")
+            ),
+        })
+    st.dataframe(pd.DataFrame(syn_data), width="stretch")
+    st.subheader("🏛️ Concept Hierarchy")
+    hierarchy_data: List[Dict[str, str]] = []
+    for concept in valid_concepts[:20]:
+        if concept in ontology.concepts:
+            node = ontology.concepts[concept]
+            if node.hypernyms:
+                for hyp in node.hypernyms:
+                    hierarchy_data.append({
+                        "Child": concept, "Parent": hyp,
+                        "Relation": "is-a",
+                    })
+            if node.hyponyms:
+                for hyp in node.hyponyms:
+                    if hyp in valid_concepts:
+                        hierarchy_data.append({
+                            "Parent": concept, "Child": hyp,
+                            "Relation": "has-subtype",
+                        })
+    if hierarchy_data:
+        st.dataframe(
+            pd.DataFrame(hierarchy_data), width="stretch",
+        )
+    else:
+        st.info("No hierarchical relationships found in current concept set.")
+
+
+# ============================================================================
+# MICROTRANSFORMER #2: UI RENDERING (with Battery expert labels)
+# ----------------------------------------------------------------------------
+# v6.2 FIX: The postprocessing panel no longer writes to widget-backed keys.
+# All widget keys are seeded by `init_widget_defaults()` at the top of main().
+# Resets happen inside `on_click` callbacks, which run *before* widgets render.
+# ============================================================================
+def render_microtransformer_postprocessing_panel() -> Dict[str, Any]:
+    """Postprocessing customization panel for Microtransformer visualizations.
+
+    Returns a dict the caller consumes directly. The panel never writes to
+    a widget-backed session-state key outside of callbacks.
+    """
+
+    def _reset_mt_post_defaults() -> None:
+        for k in (
+            "mt_post_cmap",
+            "mt_post_cmap_reverse",
+            "mt_post_font_size",
+            "mt_post_title_size",
+            "mt_post_sankey_pad",
+            "mt_post_sankey_opacity",
+            "mt_post_bar_text_pos",
+            "mt_post_bar_text_size",
+        ):
+            st.session_state[k] = _MT_WIDGET_DEFAULTS[k]
+
+    with st.expander("🎨 Microtransformer Visualization Customization", expanded=False):
+        st.markdown("**Colormap & Theme**")
+        col1, col2 = st.columns(2)
+        with col1:
+            # NOTE: no manual write to st.session_state["mt_post_cmap"].
+            # The widget with key="mt_post_cmap" owns that key.
+            st.selectbox(
+                "Colormap (Postprocessing)",
+                options=list(SUPPORTED_COLORMAPS.keys()),
+                key="mt_post_cmap",
+            )
+        with col2:
+            st.checkbox("Reverse Colormap", key="mt_post_cmap_reverse")
+
+        st.markdown("**Typography**")
+        col3, col4 = st.columns(2)
+        with col3:
+            st.slider("Font Size", 8, 24, key="mt_post_font_size")
+        with col4:
+            st.slider("Title Size", 12, 32, key="mt_post_title_size")
+
+        st.markdown("**Sankey & Bar Settings**")
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+            st.slider("Sankey Node Padding", 5, 50, key="mt_post_sankey_pad")
+        with col6:
+            st.slider("Sankey Link Opacity", 0.1, 1.0, 0.4,
+                      step=0.05, key="mt_post_sankey_opacity")
+        with col7:
+            st.selectbox(
+                "Bar Text Position",
+                ["outside", "inside", "auto", "none"],
+                key="mt_post_bar_text_pos",
+            )
+        with col8:
+            st.slider("Bar Text Size", 6, 16, key="mt_post_bar_text_size")
+
+        st.button(
+            "🔄 Reset to Defaults",
+            key="mt_post_reset",
+            on_click=_reset_mt_post_defaults,
+        )
+
+    return {
+        "cmap": st.session_state.get("mt_post_cmap", "viridis"),
+        "font_size": st.session_state.get("mt_post_font_size", 11),
+        "title_size": st.session_state.get("mt_post_title_size", 15),
+        "font_family": st.session_state.get(
+            "mt_font_family", "Inter, Segoe UI, Roboto, sans-serif"
+        ),
+        "sankey_pad": st.session_state.get("mt_post_sankey_pad", 15),
+        "sankey_opacity": st.session_state.get("mt_post_sankey_opacity", 0.4),
+        "bar_text_position": st.session_state.get("mt_post_bar_text_pos", "outside"),
+        "bar_text_size": st.session_state.get("mt_post_bar_text_size", 12),
+    }
+
+
+def render_chord_diagram(token_labels: List[str], routing_np: np.ndarray,
+                         scale: List[str], theme: Dict) -> go.Figure:
+    """
+    Render a chord diagram showing token → expert flow.
+    Falls back to a matrix heatmap if the chord library is unavailable.
+    """
+    try:
+        from chord import Chord
+        # Build a matrix: rows = tokens (sources), cols = experts (targets)
+        n_tokens, n_experts = routing_np.shape
+        matrix = np.zeros((n_tokens + n_experts, n_tokens + n_experts))
+        for i, token in enumerate(token_labels):
+            top_indices = np.argsort(routing_np[i])[-3:][::-1]
+            for j in top_indices:
+                matrix[i, n_tokens + j] = routing_np[i][j]
+
+        names = [f"T: {t}" for t in token_labels] + DENDRITE_EXPERT_LABELS
+        chord_fig = Chord(matrix, names=names, colors=scale)
+        fig = chord_fig.plotly_chord()
+        fig = apply_mt_chart_style(fig, theme, is_axial=False)
+        fig.update_layout(
+            title_text="Token → Expert Routing Chord Diagram",
+            height=550,
+            margin=dict(l=80, r=80, t=80, b=80),
+        )
+        return fig
+    except ImportError:
+        # Fallback: arc-style heatmap using Plotly
+        n_tokens, n_experts = routing_np.shape
+        matrix = np.zeros((n_tokens, n_experts))
+        for i in range(n_tokens):
+            top_indices = np.argsort(routing_np[i])[-3:][::-1]
+            for j in top_indices:
+                matrix[i, j] = routing_np[i][j]
+
+        fig = px.imshow(
+            matrix,
+            x=DENDRITE_EXPERT_LABELS,
+            y=token_labels,
+            labels=dict(x="Expert Domain", y="Path Token", color="Activation"),
+            color_continuous_scale=scale,
+            aspect="auto",
+            height=450,
+            title="Token → Expert Routing Matrix (Chord fallback)",
+        )
+        fig = apply_mt_chart_style(fig, theme, is_axial=True)
+        return fig
+
+
+def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: DomainOntology):
+    st.subheader("🧠 Microtransformer #2: LatentMoE KG‑RAG Extractor")
+    st.markdown("""
+    Encodes graph traversals (node‑edge‑node) using **Latent Mixture of Experts**.
+    Pick a source and target concept – the shortest path is tokenised and fed through
+    32 specialised latent domains for dendrite growth in partitioned electrolytes.
+    """)
+
+    if not analysis_data or "nx_graph" not in analysis_data:
+        st.info("Please build the concept graph first.")
+        return
+
+    # Use the safeguard to ensure ontology is never empty
+    ontology = ensure_ontology_populated()
+    nx_graph = analysis_data["nx_graph"]
+    concept_to_id = analysis_data["concept_to_id"]
+    num_nodes = len(concept_to_id)
+
+    if num_nodes < 2:
+        st.error("Graph has fewer than 2 nodes.")
+        return
+
+    # Added ConceptType.MODEL so models aren't hidden
+    type_order = [
+        ConceptType.MATERIAL, ConceptType.PARAMETER, ConceptType.PHENOMENON,
+        ConceptType.PROPERTY, ConceptType.PROCESS, ConceptType.METHOD,
+        ConceptType.MODEL, ConceptType.MICROSTRUCTURE, ConceptType.GENERAL,
+    ]
+    type_labels = {
+        ConceptType.MATERIAL: "📦 Materials",
+        ConceptType.PARAMETER: "🎛️ Parameters",
+        ConceptType.PHENOMENON: "⚡ Phenomena",
+        ConceptType.PROPERTY: "📊 Properties",
+        ConceptType.PROCESS: "🔥 Processes",
+        ConceptType.METHOD: "🔬 Methods",
+        ConceptType.MODEL: "🧠 Models",
+        ConceptType.MICROSTRUCTURE: "🏗️ Microstructure",
+        ConceptType.GENERAL: "📋 General",
+    }
+
+    graph_concepts = set(concept_to_id.keys())
+    ontology_concepts = set(ontology.concepts.keys())
+    all_available = sorted(graph_concepts | ontology_concepts)
+    in_graph = {c for c in all_available if c in concept_to_id}
+
+    grouped_options = []
+    for ctype in type_order:
+        members = [c for c in all_available if ontology.get_concept_type(c) == ctype]
+        if members:
+            grouped_options.append(f"--- {type_labels.get(ctype, ctype.value)} ---")
+            for m in members:
+                tag = " ✅" if m in in_graph else " ⚠️ not in graph"
+                grouped_options.append(f"{m}{tag}")
+
+    separator_set = {s for s in grouped_options if s.startswith("--- ")}
+
+    def strip_tag(option_str: Optional[str]) -> str:
+        if not option_str:
+            return option_str
+        for marker in [" ✅", " ⚠️ not in graph"]:
+            if option_str.endswith(marker):
+                return option_str[:-len(marker)]
+        return option_str
+
+    QUERY_CONCEPT_MAP = [
+        (r"\bmodulus\b.*\bstress\b", "youngs_modulus", "von_mises_stress"),
+        (r"\bstress\b.*\bmodulus\b", "von_mises_stress", "youngs_modulus"),
+        (r"\bratio\b.*\bdendrite\b", "solid_liquid_ratio", "dendrite_length"),
+        (r"\bdendrite\b.*\bratio\b", "dendrite_length", "solid_liquid_ratio"),
+        (r"\boverpotential\b.*\bgrowth\b", "overpotential", "dendrite_growth"),
+        (r"\bgrowth\b.*\boverpotential\b", "dendrite_growth", "overpotential"),
+        (r"\beigenstrain\b.*\benergy\b", "eigenstrain", "mechanical_free_energy"),
+        (r"\benergy\b.*\beigenstrain\b", "mechanical_free_energy", "eigenstrain"),
+        (r"\bphi\b.*\beta\b", "order_parameter_phi", "order_parameter_eta"),
+        (r"\beta\b.*\bphi\b", "order_parameter_eta", "order_parameter_phi"),
+    ]
+
+    quick_query = st.text_input(
+        "Or type a natural‑language question:",
+        value=st.session_state.get('synced_query', "How does the solid-liquid ratio in random inclusion geometry affect dendrite length and von Mises stress?"),
+        key="mt_quick_query",
+        placeholder="e.g., How does Young's modulus suppress dendrite growth?",
+    )
+
+    nlp_src, nlp_tgt = None, None
+    if quick_query.strip():
+        q_lower = quick_query.lower()
+        for pattern, src_concept, tgt_concept in QUERY_CONCEPT_MAP:
+            if re.search(pattern, q_lower):
+                if src_concept in all_available:
+                    nlp_src = src_concept
+                if tgt_concept in all_available:
+                    nlp_tgt = tgt_concept
+                break
+
+    def find_option_index(concept_name: str) -> int:
+        for i, opt in enumerate(grouped_options):
+            if strip_tag(opt) == concept_name:
+                return i
+        return 0
+
+    if nlp_src and nlp_tgt:
+        default_src_idx = find_option_index(nlp_src)
+        default_tgt_idx = find_option_index(nlp_tgt)
+    else:
+        default_src_idx = find_option_index("solid_liquid_ratio")
+        default_tgt_idx = find_option_index("dendrite_length")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        src_option = st.selectbox(
+            "Source Concept:",
+            options=grouped_options,
+            index=default_src_idx,
+            key="mt_src_select",
+        )
+    with col2:
+        tgt_option = st.selectbox(
+            "Target Concept:",
+            options=grouped_options,
+            index=default_tgt_idx,
+            key="mt_tgt_select",
+        )
+
+    selected_src = None if src_option in separator_set else strip_tag(src_option)
+    selected_tgt = None if tgt_option in separator_set else strip_tag(tgt_option)
+
+    if nlp_src and nlp_tgt:
+        st.success(f"🧠 NLP parsed: **{nlp_src}** → **{nlp_tgt}** (dropdowns auto-set)")
+
+    if selected_src and selected_tgt and selected_src == selected_tgt:
+        st.error("Source and target must be different concepts.")
+        selected_src = None
+
+    torch.manual_seed(int(st.session_state.get("mt_seed", 42)))
+    kg_model = LatentMoEKGExtractor(num_nodes, NUM_EDGE_TYPES)
+    kg_model.eval()
+
+    # --- QDWA Router Prior ---
+    xi = st.sidebar.slider(
+        "Router prior strength ξ (QDWA)",
+        0.0, 2.0, 1.0, 0.25, key="mt_prior_xi"
+    )
+    router_prior = None
+    la = st.session_state.get("last_query_analysis")
+    if xi > 0 and la is not None and getattr(la, "category_weights", None):
+        prior = np.array([
+            math.log(max(la.category_weights.get(EXPERT_CATEGORY[i], 0.25), 1e-4))
+            for i in range(32)
+        ])
+        router_prior = torch.tensor(xi * prior, dtype=torch.float32)
+
+    # --- CHART CUSTOMIZATION UI ---
+    st.markdown("---")
+    st.markdown("#### 🔬 Expert Routing Activation Analysis")
+
+    def _reset_mt_chart_defaults() -> None:
+        for k in (
+            "mt_cmap", "mt_font_family", "mt_font_size",
+            "mt_title_size", "mt_cbar_len", "mt_cbar_thick",
+            "mt_cbar_title", "mt_show_grid", "mt_seed",
+        ):
+            st.session_state[k] = _MT_WIDGET_DEFAULTS[k]
+
+    with st.expander("🎨 Chart Customization (colormap, fonts, colorbar)", expanded=False):
+        _cmaps = list(SUPPORTED_COLORMAPS.keys())
+        # NOTE: no `index=...` and no manual write — the widget with
+        # key="mt_cmap" owns this key. Its initial value was seeded by
+        # init_widget_defaults() before any widget was created.
+        st.selectbox(
+            "Colormap:",
+            options=_cmaps,
+            key="mt_cmap",
+            help=(
+                "Sequential (viridis/inferno/turbo) best for heatmaps; "
+                "jet/rainbow are popular but not colorblind-safe."
+            ),
+        )
+        st.selectbox(
+            "Font family (labels, ticks, colorbar):",
+            [
+                "Inter, Segoe UI, Roboto, sans-serif",
+                "Arial, Helvetica, sans-serif",
+                "Georgia, serif",
+                "Courier New, monospace",
+                "Times New Roman, serif",
+            ],
+            key="mt_font_family",
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.slider("Tick font size", 8, 20, key="mt_font_size")
+        c2.slider("Title font size", 10, 26, key="mt_title_size")
+        c3.slider("Colorbar length", 0.3, 1.0, step=0.05, key="mt_cbar_len")
+        c4.slider("Colorbar thickness (px)", 6, 40, key="mt_cbar_thick")
+        st.text_input("Colorbar title", key="mt_cbar_title")
+        st.checkbox("Show gridlines", key="mt_show_grid")
+        st.number_input("Torch seed (reproducible demo)", 0, 9999, key="mt_seed")
+        st.button(
+            "🔄 Reset Chart Defaults",
+            key="mt_chart_reset",
+            on_click=_reset_mt_chart_defaults,
+        )
+
+    if st.button("⚡ Run LatentMoE Inference on Path", type="primary"):
+        if not selected_src or not selected_tgt:
+            st.warning("Please select both source and target.")
+        elif selected_src == selected_tgt:
+            st.warning("Source and target must be different.")
+        else:
+            path = None
+            if selected_src in concept_to_id and selected_tgt in concept_to_id:
+                if selected_src in nx_graph and selected_tgt in nx_graph:
+                    try:
+                        path = nx.shortest_path(nx_graph, source=selected_src, target=selected_tgt)
+                        st.success(f"✅ Path found in graph: {' → '.join(path)}")
+                    except nx.NetworkXNoPath:
+                        pass
+
+            if path is None:
+                ontology_paths = ontology.infer_path(selected_src, selected_tgt, max_depth=3)
+                if ontology_paths:
+                    path = ontology_paths[0]
+                    st.info(f"🔍 Ontology inference path: {' → '.join(path)}")
+                else:
+                    st.error(f"No path found between `{selected_src}` and `{selected_tgt}`.")
+                    path = None
+
+            if path is None:
+                st.session_state.pop("mt_last_run", None)
+            else:
+                st.success(f"🚀 Processing Path: {' → '.join(path)}")
+                node_indices = []
+                ontology_only_tokens = []
+                for n in path:
+                    if n in concept_to_id:
+                        node_indices.append(concept_to_id[n])
+                    else:
+                        node_indices.append(0)
+                        ontology_only_tokens.append(n)
+                node_seq = torch.tensor([node_indices], dtype=torch.long)
+
+                edge_indices = []
+                for i in range(len(path) - 1):
+                    edge_data = nx_graph.get_edge_data(path[i], path[i+1])
+                    if edge_data:
+                        rel_str = edge_data.get('edge_type', 'semantic').upper()
+                        edge_indices.append(RELATIONSHIP_TO_IDX.get(rel_str, 0))
+                    else:
+                        rel = next((r for r in ontology.relationships if r.source == path[i] and r.target == path[i+1]), None)
+                        if rel:
+                            edge_indices.append(RELATIONSHIP_TO_IDX.get(rel.rel_type.name, 0))
+                        else:
+                            edge_indices.append(RELATIONSHIP_TO_IDX.get("INFLUENCES", 0))
+                edge_seq = torch.tensor([edge_indices], dtype=torch.long)
+
+                if ontology_only_tokens:
+                    st.caption(f"⚠️ Tokens {ontology_only_tokens} are ontology-only (node ID 0).")
+
+                with torch.no_grad():
+                    out, routing_weights = kg_model(node_seq, edge_seq, router_prior=router_prior)
+
+                avg_weights = routing_weights.mean(dim=1).squeeze(0).numpy()
+                st.session_state["mt_last_run"] = {
+                    "path": path,
+                    "routing": routing_weights.squeeze(0).numpy(),
+                    "avg": avg_weights,
+                }
+
+    # --- Postprocessing customization panel ---
+    post_params = render_microtransformer_postprocessing_panel()
+
+    run = st.session_state.get("mt_last_run")
+    if run:
+        path = run["path"]
+        routing_np = run["routing"]
+        avg_weights = run["avg"]
+        token_labels = [n.replace("_", " ").title() for n in path]
+        theme = THEME_PRESETS.get(st.session_state.get("theme", "Bright (Default)"), THEME_PRESETS["Bright (Default)"])
+        scale = plotly_continuous_scale(post_params.get("cmap", "viridis"))
+
+        # --- Enhanced Heatmap with Custom Hovertext ---
+        st.markdown("#### 📊 Per‑Token Expert Routing Heatmap")
+        per_token_df = pd.DataFrame(routing_np, index=token_labels, columns=DENDRITE_EXPERT_LABELS)
+
+        hover_text = []
+        for i, token in enumerate(token_labels):
+            token_row = []
+            for j, expert in enumerate(DENDRITE_EXPERT_LABELS):
+                token_row.append(
+                    f"<b>Token:</b> {token}<br>"
+                    f"<b>Expert:</b> {expert}<br>"
+                    f"<b>Weight:</b> {routing_np[i][j]:.4f}<br>"
+                    f"<b>Rank:</b> {np.argsort(np.argsort(-routing_np[i]))[j] + 1}/32"
+                )
+            hover_text.append(token_row)
+
+        fig_heat = px.imshow(
+            per_token_df.T,
+            labels=dict(x="Path Token", y="Expert Domain", color="Activation"),
+            color_continuous_scale=scale,
+            aspect="auto",
+            height=450
+        )
+
+        fig_heat.update_traces(hoverinfo="text", text=hover_text, customdata=hover_text)
+        fig_heat.update_layout(hovermode="closest")
+        fig_heat.update_layout(
+            font=dict(family=post_params.get("font_family"), size=post_params.get("font_size", 11), color=theme["font"]),
+            title=dict(font=dict(size=post_params.get("title_size", 15)))
+        )
+
+        st.plotly_chart(apply_mt_chart_style(fig_heat, theme), width="stretch")
+
+        # --- Sankey / Chord ---
+        st.markdown("#### 🌊 Token-to-Expert Routing Flow")
+        chart_type = st.radio("Flow chart type:", ["Sankey", "Chord"], index=0, horizontal=True)
+
+        if chart_type == "Sankey":
+            sanky_tokens = [f"Token: {t}" for t in token_labels]
+            sanky_experts = DENDRITE_EXPERT_LABELS
+            sankey_labels = sanky_tokens + sanky_experts
+
+            sanky_sources = []
+            sanky_targets = []
+            sanky_values = []
+
+            for i, token in enumerate(sanky_tokens):
+                token_weights = routing_np[i]
+                top_indices = np.argsort(token_weights)[-3:][::-1]
+                for idx in top_indices:
+                    val = float(token_weights[idx])
+                    if val > 0:
+                        sanky_sources.append(sankey_labels.index(token))
+                        sanky_targets.append(sankey_labels.index(sanky_experts[idx]))
+                        sanky_values.append(val)
+
+            token_colors = px.colors.qualitative.Pastel[:len(sanky_tokens)]
+            expert_colors = scale[:len(sanky_experts)]
+            node_colors = token_colors + expert_colors
+
+            link_colors = []
+            for s in sanky_sources:
+                hex_color = node_colors[s]
+                if isinstance(hex_color, str) and hex_color.startswith('rgb('):
+                    rgb_vals = hex_color[4:-1].split(',')
+                    link_colors.append(f"rgba({rgb_vals[0].strip()},{rgb_vals[1].strip()},{rgb_vals[2].strip()},0.4)")
+                elif isinstance(hex_color, str) and hex_color.startswith('#') and len(hex_color) == 7:
+                    r = int(hex_color[1:3], 16)
+                    g = int(hex_color[3:5], 16)
+                    b = int(hex_color[5:7], 16)
+                    link_colors.append(f"rgba({r},{g},{b},0.4)")
+                else:
+                    link_colors.append("rgba(100,100,100,0.4)")
+
+            fig_sankey = go.Figure(data=[go.Sankey(
+                node=dict(
+                    pad=post_params.get("sankey_pad", 15),
+                    thickness=20,
+                    line=dict(color="black", width=0.5),
+                    label=sankey_labels,
+                    color=node_colors
+                ),
+                link=dict(
+                    source=sanky_sources,
+                    target=sanky_targets,
+                    value=sanky_values,
+                    color=link_colors
+                )
+            )])
+
+            fig_sankey.update_layout(
+                title_text="LatentMoE Routing Flow (Top 3 Experts per Token)",
+                height=500,
+                font=dict(
+                    family=post_params.get("font_family", "Inter, Segoe UI, Roboto, sans-serif"),
+                    size=max(11, post_params.get("font_size", 11) - 1),
+                    color=theme.get("font", "#000000")
+                )
+            )
+            st.plotly_chart(apply_mt_chart_style(fig_sankey, theme, is_axial=False), width="stretch")
+        else:
+            fig_chord = render_chord_diagram(token_labels, routing_np, scale, theme)
+            st.plotly_chart(apply_mt_chart_style(fig_chord, theme, is_axial=False), width="stretch")
+
+        # --- Enhanced Bar Chart ---
+        st.markdown("#### 📊 Averaged Expert Activation")
+
+        df_experts = pd.DataFrame({
+            "Expert Domain": DENDRITE_EXPERT_LABELS,
+            "Activation Weight": avg_weights,
+        }).sort_values("Activation Weight", ascending=False)
+
+        df_active = df_experts[df_experts["Activation Weight"] > 0.05].copy()
+
+        if df_active.empty:
+            st.warning("No experts exceed the 0.05 activation threshold — showing all experts instead.")
+            df_active = df_experts.copy()
+
+        fig = px.bar(
+            df_active,
+            x="Expert Domain",
+            y="Activation Weight",
+            title=f"Top Activated Experts: {' → '.join(token_labels)}",
+            color="Activation Weight",
+            color_continuous_scale=scale,
+            text=df_active["Activation Weight"].apply(lambda x: f"{x:.3f}")
+        )
+
+        fig.update_traces(
+            textposition=post_params.get("bar_text_position", "outside"),
+            textfont_size=post_params.get("bar_text_size", 12)
+        )
+        y_max = float(df_active["Activation Weight"].max()) if not df_active.empty else 1.0
+        fig.update_layout(
+            xaxis_tickangle=-45,
+            height=450,
+            yaxis=dict(range=[0, y_max * 1.15]),
+            font=dict(family=post_params.get("font_family"), size=post_params.get("font_size", 11), color=theme["font"])
+        )
+        st.plotly_chart(apply_mt_chart_style(fig, theme), width="stretch")
+
+        st.markdown("**Top Activated Experts:**")
+        top_experts = df_experts.head(4)
+        cols = st.columns(4)
+        for i, (_, row) in enumerate(top_experts.iterrows()):
+            with cols[i]:
+                st.metric(row["Expert Domain"], f"{row['Activation Weight']:.3f}")
+
+        st.markdown("#### 🔬 Scientific Interpretation")
+        interpretation_map = {
+            "Phase Field Method": "Variational framework evolving order parameters to minimize the coupled electrochemical-mechanical free energy.",
+            "Order Parameter Eta": "Distinguishes the electrode (eta=1) from the electrolyte (eta=0); its evolution IS dendrite growth.",
+            "Order Parameter Phi": "Marks static solid partitions (phi=1); suppresses eta and confines the liquid channels.",
+            "Chemical Free Energy": "Bulk driving force for lithium deposition; lowered locally by overpotential and concentration.",
+            "Mechanical Free Energy": "Elastic strain energy that raises the deposition barrier and halts the dendrite tip.",
+            "Gradient Energy Coefficient": "Sets the diffuse interface thickness and the surface-energy penalty on growth.",
+            "Solid-Liquid Interface": "The diffuse boundary where ionic, chemical, and mechanical resistance all localize.",
+            "Dendrite Length Metric": "Maximum tip penetration in the primary growth direction — the primary suppression target.",
+            "Dendrite Area Metric": "Net deposited lithium area via h(eta); quantifies total growth, not just the tip.",
+            "Young's Modulus Interpolation": "Stiffness blended across phases via the order parameters; higher modulus yields higher stress.",
+            "Poisson's Ratio": "Approaches 0.5 in the liquid; governs the incompressible mechanical response.",
+            "Eigenstrain": "Volumetric expansion strain assigned to the electrode phase; sources the mechanical free energy.",
+            "Von Mises Stress": "Peak tensile stress at the interface; the mechanical signal that blocks further deposition.",
+            "Elastic Strain Energy": "Stored strain-energy density whose gradient opposes the chemical driving force.",
+            "Butler-Volmer Kinetics": "Charge-transfer law setting the electrode current from the local overpotential.",
+            "Overpotential": "Voltage departure from equilibrium; the electrochemical trigger for dendrite nucleation.",
+            "Ionic Concentration": "Local Li+ availability; depletion at the tip starves growth, concentration drives it.",
+            "Solid-Liquid Ratio (S/L)": "Fraction of solid phase; higher S/L fragments liquid channels and suppresses length.",
+            "Horizontal Layering Geometry": "Layered solid/liquid arrangement; continuous channels guide growth in preferred directions.",
+            "Vertical Stripe Geometry": "Vertical stripes break up lateral current and redirect dendrite propagation.",
+            "Random Inclusion Geometry": "Dispersed inclusions isotropically block growth; often the most suppressive architecture.",
+            "Nucleation Perturbation": "Initial seed of eta; its amplitude and position set where dendrites initiate.",
+            "LLZO Solid Electrolyte": "Stiff garnet partition (high modulus) that mechanically suppresses dendrites.",
+            "LiPF6 Liquid Electrolyte": "Carbonate liquid medium enabling ion transport between partitions.",
+            "Lithium Metal Anode": "The depositing electrode phase; the source material of the dendrite.",
+            "Mechanical Suppression": "Stress-induced halt of propagation; the core lever beyond geometry.",
+            "Geometric Confinement": "Physical restriction by partition geometry; complementary to mechanical suppression.",
+            "Multiphysics Coupling": "Joint solve of electrochemistry, mechanics, and phase field; the manuscript's central thesis.",
+            "Finite Element Analysis": "Numerical solver for mechanical equilibrium and the von Mises stress field.",
+            "Thermodynamic Equilibrium": "Minimum-free-energy state; the reference for overpotential and driving force.",
+            "Dead Lithium Formation": "Electrically isolated lithium from detached dendrites; a capacity-loss outcome.",
+            "Cycle Life Degradation": "Capacity fade over cycles, accelerated by dendrite-induced dead lithium.",
+        }
+        top3_names = df_experts.head(3)["Expert Domain"].tolist()
+        for expert_name in top3_names:
+            interp = interpretation_map.get(expert_name, "Routing capacity allocated to decode this dendrite-growth domain.")
+            st.info(f"**{expert_name}**: {interp}")
+
+        st.markdown("#### 🔗 Reasoning Chain Along Path")
+        for i in range(len(path) - 1):
+            src_name = path[i].replace("_", " ").title()
+            tgt_name = path[i + 1].replace("_", " ").title()
+            rel_desc = "unknown"
+            for r in ontology.relationships:
+                if r.source == path[i] and r.target == path[i + 1]:
+                    rel_desc = f"{r.rel_type.value} (confidence: {r.confidence:.2f})"
+                    break
+            token_experts = pd.DataFrame({"Expert": DENDRITE_EXPERT_LABELS, "Weight": routing_np[i]}).sort_values("Weight", ascending=False)
+            top2 = ", ".join(f"{row['Expert']} ({row['Weight']:.3f})" for _, row in token_experts.head(2).iterrows())
+            st.markdown(f"**Step {i+1}**: `{src_name}` --[{rel_desc}]--> `{tgt_name}`  *(top experts: {top2})*")
+
+
+def split_into_batches(
+    df: pd.DataFrame, batch_size: int
+) -> Iterator[Tuple[int, pd.DataFrame]]:
+    total_batches = math.ceil(len(df) / batch_size)
+    for i in range(total_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(df))
+        yield start_idx, df.iloc[start_idx:end_idx]
+
+
+def merge_graphs(existing_graph: nx.Graph, new_graph: nx.Graph) -> nx.Graph:
+    merged = existing_graph
+    for node, data in new_graph.nodes(data=True):
+        if node in merged:
+            merged.nodes[node]["frequency"] = (
+                merged.nodes[node].get("frequency", 0)
+                + data.get("frequency", 0)
+            )
+            for attr in ("concept_type", "definition"):
+                if not merged.nodes[node].get(attr) and data.get(attr):
+                    merged.nodes[node][attr] = data[attr]
+        else:
+            merged.add_node(node, **data)
+    for u, v, data in new_graph.edges(data=True):
+        if merged.has_edge(u, v):
+            ed = merged[u][v]
+            ed["cooccurrence"] = (
+                ed.get("cooccurrence", 0) + data.get("cooccurrence", 0)
+            )
+            ed["semantic"] = max(
+                ed.get("semantic", 0) or 0, data.get("semantic", 0) or 0
+            )
+            ed["inferred"] = bool(ed.get("inferred", False)) or bool(
+                data.get("inferred", False)
+            )
+            if data.get("confidence") is not None:
+                ed["confidence"] = max(
+                    ed.get("confidence", 0), data["confidence"]
+                )
+            if data.get("path") and not ed.get("path"):
+                ed["path"] = data["path"]
+            if (
+                ed.get("edge_type", "cooccurrence") == "cooccurrence"
+                and data.get("edge_type") not in (None, "cooccurrence")
+            ):
+                ed["edge_type"] = data["edge_type"]
+        else:
+            merged.add_edge(u, v, **data)
+    return merged
+
+
+def recompute_edge_weights(nx_graph: nx.Graph, config: Dict) -> None:
+    cooc_w = config.get("COOCCURRENCE_WEIGHT", 0.7)
+    sem_w = config.get("SEMANTIC_WEIGHT", 0.2)
+    inf_w = config.get("INFERENCE_WEIGHT", 0.1)
+    for _, _, data in nx_graph.edges(data=True):
+        cooc = data.get("cooccurrence", 0)
+        sem = data.get("semantic", 0) or 0
+        inf = 1.0 if data.get("inferred", False) else 0.0
+        conf = data.get("confidence", 0.5)
+        data["weight"] = cooc_w * cooc + sem_w * sem + inf_w * inf * conf
+
+
+def extract_doc_metrics(text: str) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {}
+    gpa_matches = re.findall(r'(\d+(?:\.\d+)?)\s*gpa', text, re.I)
+    if gpa_matches:
+        metrics['youngs_modulus_gpa'] = [float(m) for m in gpa_matches]
+    mv_matches = re.findall(r'(\d+(?:\.\d+)?)\s*mv\b', text, re.I)
+    if mv_matches:
+        metrics['overpotential_mv'] = [float(m) for m in mv_matches]
+    um_matches = re.findall(r'(\d+(?:\.\d+)?)\s*(?:µm|um|micron)s?', text, re.I)
+    if um_matches:
+        metrics['dendrite_length_um'] = [float(m) for m in um_matches]
+    ratio_matches = re.findall(r'(\d+(?:\.\d+)?)\s*[:/]\s*(\d+(?:\.\d+)?)', text)
+    if ratio_matches:
+        metrics['ratios'] = [float(a) / float(b) if float(b) != 0 else 0.0 for a, b in ratio_matches]
+    return metrics
+
+
+class IncrementalGraphBuilder(ReasoningEnhancedGraphBuilder):
+    @timed
+    def build_batch_graph(
+        self,
+        batch_concepts: List[List[str]],
+        valid_concepts: List[str],
+        concept_to_id: Dict[str, int],
+        batch_doc_freq: Dict[str, int],
+        embed_model=None,
+        config: Dict = None,
+    ) -> nx.Graph:
+        if config is None:
+            config = get_adaptive_config(1000)
+        nx_graph = nx.Graph()
+        for c in valid_concepts:
+            concept_type = self.ontology.get_concept_type(c)
+            definition = self.ontology.get_definition(c)
+            nx_graph.add_node(
+                c,
+                frequency=batch_doc_freq.get(c, 0),
+                concept_type=concept_type.value,
+                definition=definition,
+                degree=0,
+            )
+        cooccurrence_map: Dict[Tuple[str, str], int] = defaultdict(int)
+        for concepts in batch_concepts:
+            valid_in_doc = [c for c in concepts if c in concept_to_id]
+            for i in range(len(valid_in_doc)):
+                for j in range(i + 1, len(valid_in_doc)):
+                    u, v = valid_in_doc[i], valid_in_doc[j]
+                    if u != v:
+                        key = tuple(sorted([u, v]))
+                        cooccurrence_map[key] += 1
+        for (u, v), count in cooccurrence_map.items():
+            nx_graph.add_edge(
+                u, v,
+                weight=float(count),
+                cooccurrence=count,
+                semantic=0.0,
+                edge_type='cooccurrence',
+                inferred=False,
+            )
+        if embed_model and len(valid_concepts) >= 10:
+            self._add_semantic_edges(
+                nx_graph, valid_concepts, embed_model, config
+            )
+        if st.session_state.get('use_inference', True):
+            self._add_inferred_edges(nx_graph, valid_concepts)
+        self._add_hierarchical_edges(nx_graph, valid_concepts)
+        self._compute_final_weights(nx_graph, config)
+        return nx_graph
+
+
+def reset_batch_state(clear_analysis: bool = False) -> None:
+    st.session_state.batch_state = None
+    st.session_state.pop("batch_trigger", None)
+    if clear_analysis:
+        st.session_state.analysis_data = None
+        st.session_state.burst_df = None
+        st.session_state.drift_df = None
+        st.session_state.genealogy_df = None
+        st.session_state.bridge_df = None
+        st.session_state.motifs = {}
+        st.session_state.edit_history = GraphEditHistory()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def render_batch_processing_controls() -> None:
+    st.markdown("---")
+    st.subheader("📦 Batch Processing (≤1 GB RAM)")
+    st.toggle(
+        "Enable batch processing",
+        key="batch_mode",
+        help=(
+            "Process documents in small batches with incremental graph "
+            "merging and memory cleanup after each batch. Recommended for "
+            "Streamlit Cloud free tier (1 GB RAM)."
+        ),
+    )
+    if not st.session_state.get("batch_mode", False):
+        return
+    st.slider(
+        "Batch size (documents)", 100, 2000, 1000, 100,
+        key="batch_size",
+        help="Smaller batches = lower peak memory but more merge steps.",
+    )
+    st.slider(
+        "GNN epochs (final training)", 10, 50, 40, 5,
+        key="batch_gnn_epochs",
+        help="GNN is trained ONCE on the final merged graph.",
+    )
+    bs = st.session_state.get("batch_state")
+    if bs:
+        total = max(bs.get("total_batches", 1), 1)
+        done = bs.get("next_batch", 0)
+        st.progress(done / total)
+        st.caption(
+            f"Batch {done}/{total} • "
+            f"{bs.get('docs_processed', len(bs.get('all_texts', {})))} "
+            f"docs processed • "
+            f"{len(bs.get('all_texts', {}))} texts cached"
+        )
+    col_next, col_all = st.columns(2)
+    with col_next:
+        if st.button(
+            "▶️ Next batch", width="stretch",
+            disabled=bool(bs and bs.get("done")),
+        ):
+            st.session_state["batch_trigger"] = "next"
+    with col_all:
+        if st.button(
+            "⏩ All remaining", width="stretch",
+            disabled=bool(bs and bs.get("done")),
+        ):
+            st.session_state["batch_trigger"] = "all"
+    if bs:
+        if st.button("🗑️ Reset batch state", width="stretch"):
+            reset_batch_state(clear_analysis=True)
+            st.success("Batch state cleared!")
+            st.rerun()
+    else:
+        st.caption(
+            "Click 🚀 Build Concept Graph (or ▶️ Next batch) to start."
+        )
+
+
+BATCH_TEXT_STORE_CAP = 4000
+
+
+def build_query_whitelist(st_session):
+    if not st_session.get('query_focused_build', False):
+        return None
+    analysis = st_session.get('last_query_analysis')
+    if analysis is None:
+        return None
+    whitelist = set(analysis.explicitly_mentioned)
+    whitelist.update(analysis.inferred_concepts)
+    whitelist.update(st_session.get('last_query_dynamic_concepts', set()))
+    whitelist.update(st_session.get('last_query_bridge_concepts', {}).keys())
+
+    pdef = DENDRITE_RESEARCH_PROBLEMS.get(analysis.primary_problem)
+    if pdef is not None:
+        whitelist.update(pdef.key_concepts)
+        whitelist.update(pdef.relevant_descriptors)
+        whitelist.update(pdef.relevant_properties)
+        whitelist.update(pdef.relevant_phenomena)
+        for src, _rel, tgt in pdef.key_relationships:
+            whitelist.update([src, tgt])
+
+    ontology = st_session.get('ontology')
+    if ontology is not None:
+        whitelist = {c for c in whitelist if c in ontology.concepts}
+
+    if len(whitelist) < 8 and ontology is not None:
+        extra = set()
+        for c in list(whitelist):
+            node = ontology.concepts.get(c)
+            if node:
+                extra.update(node.hypernyms)
+                extra.update(node.hyponyms)
+                extra.update(node.related_processes)
+                extra.update(node.related_properties)
+        for r in ontology.relationships:
+            if r.source in whitelist:
+                extra.add(r.target)
+            elif r.target in whitelist:
+                extra.add(r.source)
+        whitelist.update({c for c in extra if c in ontology.concepts})
+
+    W = getattr(analysis, "category_weights", {})
+    if (
+        W
+        and getattr(analysis, "concentration", 0.0) >= 0.5
+        and ontology is not None
+    ):
+        k_star = max(W, key=W.get)
+        whitelist.update(
+            c
+            for c in ontology.concepts
+            if categorize_dendrite_concept(c) == k_star
+        )
+
+    return whitelist
+
+
+def run_batch_analysis(
+    df_filtered: pd.DataFrame,
+    selected_text_cols: List[str],
+    ontology: DomainOntology,
+    run_mode: str = "all",
+) -> None:
+    overall_start = time.perf_counter()
+    metrics = get_metrics_logger()
+    metrics.reset()
+    batch_size = int(st.session_state.get("batch_size", 1000))
+    total_docs = len(df_filtered)
+    if total_docs == 0:
+        st.error("No documents to process.")
+        return
+    total_batches = math.ceil(total_docs / batch_size)
+    metrics.set("mode", "batch")
+    metrics.set("total_docs", total_docs)
+    live_panel = st.empty()
+    try:
+        torch.set_num_threads(2)
+    except Exception:
+        pass
+
+    data_hash = hashlib.md5(
+        (
+            f"{total_docs}|{'|'.join(selected_text_cols)}|"
+            f"{df_filtered.index.min()}|{df_filtered.index.max()}"
+        ).encode("utf-8")
+    ).hexdigest()
+
+    bs = st.session_state.get("batch_state")
+    if bs is not None and (
+        bs.get("data_hash") != data_hash
+        or bs.get("batch_size") != batch_size
+    ):
+        st.info("Dataset or batch size changed — resetting batch state.")
+        reset_batch_state(clear_analysis=False)
+        bs = None
+    if bs is None:
+        bs = {
+            "data_hash": data_hash,
+            "batch_size": batch_size,
+            "total_batches": total_batches,
+            "next_batch": 0,
+            "all_concepts": [],
+            "all_metrics": [],
+            "all_texts": {},
+            "valid_doc_indices": set(),
+            "docs_processed": 0,
+            "concept_freq": defaultdict(int),
+            "concept_abstract_map": defaultdict(list),
+            "merged_graph": None,
+            "extractor": None,
+            "resolver": None,
+            "builder": None,
+            "done": False,
+        }
+        st.session_state.batch_state = bs
+
+    if bs["done"]:
+        st.success("✅ All batches already processed — see results below.")
+        return
+
+    config = get_adaptive_config(total_docs)
+    config["MIN_CONCEPT_FREQ"] = st.session_state.get('min_freq', 5)
+
+    whitelist = build_query_whitelist(st.session_state)
+    is_query_focused = st.session_state.get('query_focused_build', False) and whitelist is not None and len(whitelist) > 0
+    if is_query_focused:
+        st.info(f"🎯 Query-focused batch mode: {len(whitelist)} concepts whitelisted. MIN_CONCEPT_FREQ lowered.")
+        config["MIN_CONCEPT_FREQ"] = 1 if len(whitelist) <= 15 else 2
+    config["MIN_CONCEPT_LENGTH_WORDS"] = st.session_state.get('min_words', 2)
+    config["SIMILARITY_THRESHOLD"] = st.session_state.get('sim_threshold', 0.85)
+    config["COOCCURRENCE_WEIGHT"] = st.session_state.get('cooc_weight', 0.7)
+    config["SEMANTIC_WEIGHT"] = st.session_state.get('sem_weight', 0.2)
+    config["INFERENCE_WEIGHT"] = st.session_state.get('inf_weight', 0.1)
+
+    use_ontology = st.session_state.get('use_ontology', True)
+    embed_model = load_embedding_model()
+
+    if use_ontology and bs["extractor"] is None:
+        with st.spinner("Initializing ontology resolver (one-time)..."):
+            resolver = AdvancedConceptResolver(
+                ontology, embed_model, cache_max=2000,
+            )
+            extractor = EnhancedConceptExtractor(
+                ontology, resolver,
+                store_contexts=False, store_documents=False,
+            )
+            builder = IncrementalGraphBuilder(ontology, extractor)
+            bs["resolver"] = resolver
+            bs["extractor"] = extractor
+            bs["builder"] = builder
+            st.session_state.resolver = resolver
+            st.session_state.extractor = extractor
+        gc.collect()
+
+    pending = list(range(bs["next_batch"], total_batches))
+    if run_mode == "next":
+        pending = pending[:1]
+    if not pending:
+        st.success("✅ Nothing left to process.")
+        return
+
+    progress_bar = st.progress(0.0)
+    status = st.status("📦 Batch processing running...", expanded=True)
+
+    def _process_one_batch(batch_num: int) -> None:
+        start = batch_num * batch_size
+        end = min(start + batch_size, total_docs)
+        batch_df = df_filtered.iloc[start:end]
+        n_this = len(batch_df)
+        min_freq = config.get("MIN_CONCEPT_FREQ", 2)
+        with status:
+            st.write(
+                f"📦 Batch {batch_num + 1}/{total_batches} — "
+                f"docs {start}–{end - 1} ({n_this} docs)"
+            )
+        batch_concepts: List[List[str]] = []
+        batch_metrics: List[Dict] = []
+        batch_doc_freq: Dict[str, int] = defaultdict(int)
+        extractor = bs["extractor"]
+
+        for local_i, (_, row) in enumerate(batch_df.iterrows()):
+            text = " ".join([
+                str(row[col]) for col in selected_text_cols
+                if col in row and pd.notna(row[col])
+            ])
+            if use_ontology and extractor is not None:
+                concepts = extractor.extract_from_text(text, start + local_i, allowed_concepts=whitelist)
+            else:
+                concepts = extract_dendrite_concepts_from_text(text)
+            batch_concepts.append(concepts)
+            batch_metrics.append(extract_doc_metrics(text))
+            unique_concepts = set(concepts)
+            for c in unique_concepts:
+                batch_doc_freq[c] += 1
+                bs["concept_freq"][c] += 1
+                bs["concept_abstract_map"][c].append(start + local_i)
+            has_valid = any(
+                bs["concept_freq"].get(c, 0) >= min_freq
+                for c in unique_concepts
+            )
+            if has_valid:
+                bs["all_texts"][start + local_i] = (
+                    text[:BATCH_TEXT_STORE_CAP]
+                )
+                bs["valid_doc_indices"].add(start + local_i)
+            bs["docs_processed"] += 1
+            del text
+            if (local_i + 1) % 100 == 0 or (local_i + 1) == n_this:
+                frac = (batch_num + (local_i + 1) / n_this) / total_batches
+                progress_bar.progress(min(0.90 * frac, 0.90))
+                with status:
+                    st.write(f"  … {local_i + 1}/{n_this} docs extracted")
+
+        bs["all_concepts"].extend(batch_concepts)
+        bs["all_metrics"].extend(batch_metrics)
+
+        min_freq = config.get("MIN_CONCEPT_FREQ", 2)
+        top_n = config.get("TOP_N_CONCEPTS", 1000)
+        batch_unique: Set[str] = set()
+        for cs in batch_concepts:
+            batch_unique.update(cs)
+        batch_valid = [
+            c for c in batch_unique
+            if bs["concept_freq"].get(c, 0) >= min_freq
+        ]
+        batch_valid.sort(
+            key=lambda c: bs["concept_freq"][c], reverse=True
+        )
+        batch_valid = batch_valid[:top_n]
+        concept_to_id_batch = {c: i for i, c in enumerate(batch_valid)}
+
+        if use_ontology and bs["builder"] is not None:
+            batch_graph = bs["builder"].build_batch_graph(
+                batch_concepts, batch_valid, concept_to_id_batch,
+                batch_doc_freq, embed_model, config,
+            )
+        else:
+            batch_graph = build_hybrid_graph(
+                batch_concepts, batch_valid, concept_to_id_batch,
+                embed_model, config, ontology,
+            )
+
+        if bs["merged_graph"] is None:
+            bs["merged_graph"] = batch_graph
+        else:
+            bs["merged_graph"] = merge_graphs(bs["merged_graph"], batch_graph)
+        recompute_edge_weights(bs["merged_graph"], config)
+        bs["next_batch"] = batch_num + 1
+
+        g = bs["merged_graph"]
+        with status:
+            st.write(
+                f"✅ Batch {batch_num + 1} done — cumulative graph: "
+                f"{g.number_of_nodes()} nodes, {g.number_of_edges()} edges "
+                f"| peak RSS ≈ {get_memory_usage_mb():.0f} MB"
+            )
+        del batch_concepts, batch_metrics, batch_doc_freq
+        del batch_graph, batch_df
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _finalize() -> None:
+        merged = bs["merged_graph"]
+        if merged is None or merged.number_of_nodes() == 0:
+            st.error("No graph could be built from the processed batches.")
+            return
+        min_freq = config.get("MIN_CONCEPT_FREQ", 2)
+        top_n = config.get("TOP_N_CONCEPTS", 1000)
+        with status:
+            st.write("🧩 Finalizing — selecting top concepts...")
+        valid_concepts = [
+            c for c, f in bs["concept_freq"].items() if f >= min_freq
+        ]
+        valid_concepts.sort(
+            key=lambda c: len(bs["concept_abstract_map"].get(c, [])),
+            reverse=True,
+        )
+        valid_concepts = valid_concepts[:top_n]
+        if len(valid_concepts) < 5:
+            st.error(
+                "Too few concepts extracted. "
+                "Try lowering frequency thresholds."
+            )
+            return
+        valid_set = set(valid_concepts)
+        drop_nodes = [n for n in merged.nodes() if n not in valid_set]
+        merged.remove_nodes_from(drop_nodes)
+        del drop_nodes
+        concept_to_id = {c: i for i, c in enumerate(valid_concepts)}
+        id_to_concept = {i: c for i, c in enumerate(valid_concepts)}
+        concept_abstract_map = {
+            c: bs["concept_abstract_map"][c] for c in valid_concepts
+        }
+        progress_bar.progress(0.90)
+
+        with status:
+            st.write("🔢 Generating node embeddings...")
+        try:
+            with torch.no_grad():
+                embeddings = embed_model.encode(
+                    valid_concepts, show_progress_bar=False,
+                    batch_size=32, convert_to_numpy=True,
+                )
+            node_features = torch.tensor(embeddings, dtype=torch.float32)
+            del embeddings
+        except Exception:
+            node_features = torch.randn(len(valid_concepts), 384)
+        gc.collect()
+
+        with status:
+            st.write("🧠 Training GraphSAGE (final, once)...")
+        pos_pairs, neg_pairs = sample_edges_for_training(
+            merged, valid_concepts, concept_to_id, config, memory_safe=True,
+        )
+        epochs = int(st.session_state.get("batch_gnn_epochs", 40))
+
+        def _gnn_progress(epoch, loss):
+            frac = 0.90 + (epoch / max(epochs, 1)) * 0.05
+            progress_bar.progress(min(frac, 0.95))
+            if epoch % 10 == 0:
+                with status:
+                    st.write(f"Epoch {epoch}/{epochs} | Loss: {loss:.4f}")
+
+        gnn_model, final_emb, adj_indices, adj_values = train_gnn(
+            node_features, merged, concept_to_id,
+            pos_pairs, neg_pairs, _gnn_progress, epochs=epochs,
+        )
+        del pos_pairs, neg_pairs, adj_indices, adj_values
+        gc.collect()
+
+        with status:
+            st.write("🎯 Scoring research directions...")
+        concept_properties: Dict[str, float] = {}
+        all_metrics = bs["all_metrics"]
+        for concept in valid_concepts:
+            values: List[float] = []
+            for idx in concept_abstract_map.get(concept, []):
+                if idx < len(all_metrics):
+                    for metric_values in all_metrics[idx].values():
+                        values.extend(metric_values)
+            concept_properties[concept] = (
+                float(np.median(values)) if values else 0.0
+            )
+        X_feat: List[List[float]] = []
+        y_target: List[float] = []
+        for u, v in merged.edges():
+            pu = concept_properties.get(u, 0)
+            pv = concept_properties.get(v, 0)
+            w = merged[u][v].get('weight', 1)
+            X_feat.append([pu, pv, w])
+            y_target.append(
+                max(pu, pv) * 1.08 if max(pu, pv) > 0 else 0
+            )
+        ridge = None
+        if len(X_feat) > 5:
+            ridge = Ridge(alpha=1.0).fit(
+                np.array(X_feat), np.array(y_target)
+            )
+        top_scores = compute_research_direction_scores(
+            gnn_model, node_features, final_emb, merged,
+            valid_concepts, concept_properties, ridge, embed_model,
+        )
+        del X_feat, y_target, node_features
+        gc.collect()
+
+        with status:
+            st.write("🧪 Distillation + advanced analytics...")
+        distill_df = compute_concept_distillation(
+            valid_concepts, concept_abstract_map, bs["all_texts"],
+            max_docs_per_concept=30,
+        )
+        burst_df = None
+        drift_df = None
+        genealogy_df = None
+        bridge_df = None
+        motifs: Dict[str, Any] = {}
+        try:
+            burst_df = detect_keyword_bursts(
+                df_filtered, valid_concepts,
+                concept_abstract_map, selected_text_cols,
+            )
+            drift_df = detect_semantic_drift(
+                df_filtered, valid_concepts,
+                concept_abstract_map, selected_text_cols,
+            )
+            genealogy_df = build_concept_genealogy(
+                merged, valid_concepts, concept_abstract_map,
+            )
+            bridge_df = detect_cross_domain_bridges(
+                merged, valid_concepts, concept_abstract_map,
+            )
+            motifs = analyze_network_motifs(merged)
+        except Exception as e:
+            st.warning(f"Some analytics skipped: {e}")
+        st.session_state.burst_df = burst_df
+        st.session_state.drift_df = drift_df
+        st.session_state.genealogy_df = genealogy_df
+        st.session_state.bridge_df = bridge_df
+        st.session_state.motifs = motifs
+        gc.collect()
+
+        analysis_data = {
+            "valid_concepts": valid_concepts,
+            "concept_to_id": concept_to_id,
+            "id_to_concept": id_to_concept,
+            "concept_abstract_map": concept_abstract_map,
+            "nx_graph": merged,
+            "concept_properties": concept_properties,
+            "ridge": ridge,
+            "top_scores": top_scores,
+            "distill_df": distill_df,
+            "gnn_model": gnn_model,
+            "final_emb": final_emb,
+            "embed_model": embed_model,
+            "all_metrics": bs["all_metrics"],
+            "all_texts": bs["all_texts"],
+            "config": config,
+            "df_filtered": df_filtered,
+            "selected_text_cols": selected_text_cols,
+            "batch_info": {
+                "mode": "batch",
+                "batch_size": batch_size,
+                "total_batches": total_batches,
+                "total_docs": total_docs,
+            },
+        }
+        if use_ontology:
+            analysis_data.update({
+                "ontology": ontology,
+                "resolver": bs["resolver"],
+                "extractor": bs["extractor"],
+                "graph_builder": bs["builder"],
+                "reasoning_paths": (
+                    bs["builder"].reasoning_paths if bs["builder"] else []
+                ),
+            })
+        st.session_state.analysis_data = analysis_data
+        st.session_state.edit_history = GraphEditHistory()
+        st.session_state.edit_history.save_snapshot(
+            merged, valid_concepts, concept_to_id,
+            id_to_concept, concept_abstract_map,
+        )
+        bs["all_concepts"] = []
+        bs["valid_doc_indices"] = set()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        bs["done"] = True
+
+    try:
+        for b in pending:
+            _process_one_batch(b)
+        if bs["next_batch"] >= total_batches:
+            with status:
+                st.write("🏁 All batches processed — finalizing...")
+            _finalize()
+            total_time = time.perf_counter() - overall_start
+            progress_bar.progress(1.0)
+            status.update(
+                label=(
+                    f"Batch analysis complete! ({total_time:.1f}s, "
+                    f"peak RSS ≈ {get_memory_usage_mb():.0f} MB)"
+                ),
+                state="complete", expanded=False,
+            )
+            st.success(
+                f"✅ All {total_batches} batches processed in "
+                f"{total_time:.1f}s — peak memory ≈ "
+                f"{get_memory_usage_mb():.0f} MB"
+            )
+        else:
+            status.update(
+                label=(
+                    f"Batch {bs['next_batch']}/{total_batches} complete"
+                ),
+                state="complete", expanded=False,
+            )
+            st.info(
+                f"📦 {total_batches - bs['next_batch']} batch(es) remaining "
+                f"— click ▶️ Next batch or ⏩ All remaining in the sidebar."
+            )
+    except Exception as e:
+        st.error(f"Batch pipeline error: {e}")
+        with st.expander("Traceback"):
+            st.code(traceback.format_exc())
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ============================================================================
+# LLM QUERY PANEL (Sidebar) and Q&A TAB (Main)
+# ============================================================================
+class BatteryProblem(Enum):
+    GEOMETRY_IMPACT = "geometry_impact"
+    PHASE_PROPERTIES = "phase_properties"
+    ELECTROCHEMICAL_KINETICS = "electrochemical_kinetics"
+    MECHANICAL_SUPPRESSION = "mechanical_suppression"
+    GENERAL = "general"
+    MULTI_PROBLEM = "multi_problem"
+
+@dataclass
+class BatteryProblemDefinition:
+    problem_id: BatteryProblem
+    title: str
+    scientific_description: str
+    root_cause: str
+    key_concepts: List[str]
+    key_relationships: List[Tuple[str, str, str]]
+    solution_directions: List[str]
+    relevant_descriptors: List[str]
+    relevant_phenomena: List[str]
+    relevant_properties: List[str]
+    example_queries: List[str]
+    visualization_focus: List[str]
+
+    def get_ontology_concepts(self) -> Set[str]:
+        concepts = set(self.key_concepts + self.relevant_descriptors +
+                       self.relevant_phenomena + self.relevant_properties)
+        for src, _, tgt in self.key_relationships:
+            concepts.update([src, tgt])
+        return concepts
+
+DENDRITE_RESEARCH_PROBLEMS: Dict[BatteryProblem, BatteryProblemDefinition] = {
+    BatteryProblem.GEOMETRY_IMPACT: BatteryProblemDefinition(
+        problem_id=BatteryProblem.GEOMETRY_IMPACT,
+        title="Impact of Spatial Geometry on Dendrite Suppression",
+        scientific_description="How different spatial configurations (horizontal layering, vertical stripes, random inclusions) and the solid-liquid ratio affect dendrite length and area in a partitioned electrolyte.",
+        root_cause="Liquid channels provide paths of least resistance for ion transport and dendrite propagation; geometry that fragments these channels suppresses growth.",
+        key_concepts=["spatial_configuration", "solid_liquid_ratio", "horizontal_layering", "vertical_stripes", "random_inclusions", "dendrite_length", "dendrite_area"],
+        key_relationships=[("solid_liquid_ratio", "CONSTRAINS", "dendrite_area"),
+                           ("spatial_configuration", "DETERMINES", "dendrite_length"),
+                           ("horizontal_layering", "SUPPRESSES", "dendrite_growth")],
+        solution_directions=["Fragment liquid channels with staggered partitions",
+                             "Optimize S/L ratio to balance ionic transport and suppression",
+                             "Prefer random inclusions over continuous layers for isotropic blocking"],
+        relevant_descriptors=["domain_size", "solid_liquid_interface", "geometric_confinement"],
+        relevant_phenomena=["dendrite_growth"],
+        relevant_properties=["dendrite_length", "dendrite_area"],
+        example_queries=["How does random inclusion geometry affect dendrite length compared to horizontal layering?",
+                         "What is the optimal solid-to-liquid ratio to minimize dendrite area?"],
+        visualization_focus=["geometry_comparison", "length_area_map"]
+    ),
+    BatteryProblem.PHASE_PROPERTIES: BatteryProblemDefinition(
+        problem_id=BatteryProblem.PHASE_PROPERTIES,
+        title="Phase Properties and Order-Parameter Coupling",
+        scientific_description="How the phase-field order parameters (eta, phi), mechanical stiffness, and ionic conductivity interpolate across the domain to govern lithium deposition.",
+        root_cause="Smooth interpolation of order parameters and material constants across the solid-liquid interface sets the local driving force and resistance for dendrite propagation.",
+        key_concepts=["order_parameter_eta", "order_parameter_phi", "youngs_modulus", "poissons_ratio", "ionic_conductivity", "gradient_energy_coefficient"],
+        key_relationships=[("order_parameter_phi", "SUPPRESSES", "order_parameter_eta"),
+                           ("youngs_modulus", "INFLUENCES", "von_mises_stress"),
+                           ("ionic_conductivity", "INFLUENCES", "dendrite_growth")],
+        solution_directions=["Tune gradient energy coefficient for sharp but stable interfaces",
+                             "Select high-modulus solid phases",
+                             "Match ionic conductivity between phases"],
+        relevant_descriptors=["mobility", "lithium_metal", "solid_partition"],
+        relevant_phenomena=["thermodynamic_equilibrium"],
+        relevant_properties=["youngs_modulus", "poissons_ratio", "ionic_conductivity"],
+        example_queries=["How does the order parameter phi suppress the electrode phase eta?",
+                         "What is the role of the gradient energy coefficient at the solid-liquid interface?"],
+        visualization_focus=["order_parameter_field", "modulus_interpolation"]
+    ),
+    BatteryProblem.ELECTROCHEMICAL_KINETICS: BatteryProblemDefinition(
+        problem_id=BatteryProblem.ELECTROCHEMICAL_KINETICS,
+        title="Electrochemical Kinetics of Dendrite Nucleation",
+        scientific_description="How Butler-Volmer kinetics, overpotential, and ionic concentration drive the chemical free energy that initiates and propagates dendrites.",
+        root_cause="High overpotential lowers the nucleation barrier; concentrated ionic flux at the electrode tip amplifies the chemical driving force for lithium deposition.",
+        key_concepts=["butler_volmer_kinetics", "overpotential", "ionic_concentration", "nucleation_perturbation", "chemical_free_energy"],
+        key_relationships=[("butler_volmer_kinetics", "DRIVES", "overpotential"),
+                           ("overpotential", "DRIVES", "dendrite_growth"),
+                           ("nucleation_perturbation", "INITIATES", "dendrite_growth")],
+        solution_directions=["Reduce local overpotential with uniform current distribution",
+                             "Suppress nucleation perturbations",
+                             "Maintain balanced ionic concentration"],
+        relevant_descriptors=["ionic_conductivity", "mobility"],
+        relevant_phenomena=["dendrite_growth", "dead_lithium_formation", "cycle_life_degradation"],
+        relevant_properties=["chemical_free_energy"],
+        example_queries=["How does overpotential drive dendrite growth?",
+                         "What is the role of nucleation perturbation in initiating dendrites?"],
+        visualization_focus=["overpotential_map", "concentration_field"]
+    ),
+    BatteryProblem.MECHANICAL_SUPPRESSION: BatteryProblemDefinition(
+        problem_id=BatteryProblem.MECHANICAL_SUPPRESSION,
+        title="Mechanical Suppression via Stress and Eigenstrain",
+        scientific_description="How Young's modulus and Poisson's ratio of solid partitions generate von Mises stress and elastic strain energy that halt dendrite growth.",
+        root_cause="Stiffer solid partitions generate high von Mises stress at the interface, raising the mechanical free-energy barrier for lithium deposition.",
+        key_concepts=["youngs_modulus", "von_mises_stress", "mechanical_free_energy", "eigenstrain", "elastic_strain_energy", "mechanical_suppression"],
+        key_relationships=[("youngs_modulus", "INFLUENCES", "von_mises_stress"),
+                           ("eigenstrain", "CAUSES", "mechanical_free_energy"),
+                           ("von_mises_stress", "CONSTRAINS", "order_parameter_eta"),
+                           ("mechanical_free_energy", "SUPPRESSES", "dendrite_area")],
+        solution_directions=["Increase solid-partition modulus",
+                             "Engineer favorable eigenstrain",
+                             "Maximize elastic strain energy at the growth front"],
+        relevant_descriptors=["geometric_confinement", "finite_element_analysis"],
+        relevant_phenomena=["dendrite_growth"],
+        relevant_properties=["von_mises_stress", "mechanical_free_energy", "dendrite_length"],
+        example_queries=["How does increasing the Young's modulus of the solid partition affect maximum dendrite length?",
+                         "Explain the role of eigenstrain in mechanical free energy."],
+        visualization_focus=["stress_distribution", "strain_energy_map"]
+    ),
+    BatteryProblem.GENERAL: BatteryProblemDefinition(
+        problem_id=BatteryProblem.GENERAL,
+        title="General Dendrite Growth Inquiry",
+        scientific_description="General question about dendrite growth in partitioned electrolytes.",
+        root_cause="N/A",
+        key_concepts=["dendrite_growth", "phase_field_method"],
+        key_relationships=[],
+        solution_directions=[],
+        relevant_descriptors=[],
+        relevant_phenomena=[],
+        relevant_properties=[],
+        example_queries=["What factors affect dendrite length and area in a partitioned electrolyte?"],
+        visualization_focus=["general_overview"]
+    ),
+    BatteryProblem.MULTI_PROBLEM: BatteryProblemDefinition(
+        problem_id=BatteryProblem.MULTI_PROBLEM,
+        title="Multi-Pillar Dendrite Inquiry",
+        scientific_description="Inquiry spanning multiple pillars (geometry, phase, electrochemistry, mechanics).",
+        root_cause="N/A",
+        key_concepts=[],
+        key_relationships=[],
+        solution_directions=[],
+        relevant_descriptors=[],
+        relevant_phenomena=[],
+        relevant_properties=[],
+        example_queries=[],
+        visualization_focus=["multi_pillar_comparison"]
+    ),
+}
+
+# ============================================================================
+# QDWA: QUERY DISTILLATION & WEIGHTED ALLOCATION (5-PILLAR STRATEGY, v6.3)
+# ----------------------------------------------------------------------------
+# v6.3 adds a 5th pillar `numerical_models` so that queries about Models A–F
+# are routed through the dedicated QDWA weight bucket. The 32 LatentMoE
+# experts keep their original 4-category mapping; the 5th pillar acts purely
+# at the QDWA weight level (it changes which existing experts get amplified).
+# ============================================================================
+FOUR_CATEGORIES = ["structural_geometry", "phase_properties", "electrochemical_kinetics", "mechanical_constraints", "numerical_models"]
+CATEGORY_DISPLAY = {
+    "structural_geometry": "Structural Geometry",
+    "phase_properties": "Phase Properties",
+    "electrochemical_kinetics": "Electrochemical Kinetics",
+    "mechanical_constraints": "Mechanical Constraints",
+    "numerical_models": "Numerical Models",
+}
+_LABEL2KEY = {
+    "Structural Geometry": "structural_geometry",
+    "Phase Properties": "phase_properties",
+    "Electrochemical Kinetics": "electrochemical_kinetics",
+    "Mechanical Constraints": "mechanical_constraints",
+    "Numerical Models": "numerical_models",
+}
+
+CATEGORY_SEEDS: Dict[str, List[str]] = {k: [] for k in FOUR_CATEGORIES}
+for _c, (_parent, _) in _HIERARCHY_PARENTS.items():
+    if _parent in _LABEL2KEY:
+        CATEGORY_SEEDS[_LABEL2KEY[_parent]].append(_c)
+
+PROBLEM_TO_CATEGORY = {
+    BatteryProblem.GEOMETRY_IMPACT: "structural_geometry",
+    BatteryProblem.PHASE_PROPERTIES: "phase_properties",
+    BatteryProblem.ELECTROCHEMICAL_KINETICS: "electrochemical_kinetics",
+    BatteryProblem.MECHANICAL_SUPPRESSION: "mechanical_constraints",
+    BatteryProblem.GENERAL: None,
+    BatteryProblem.MULTI_PROBLEM: None,
+}
+
+# Blocks b(i) for the 32 LatentMoE experts (order = DENDRITE_EXPERT_LABELS).
+# v6.3 NOTE: The 5th QDWA pillar `numerical_models` has no dedicated experts
+# in this list — it influences routing purely through the QDWA weight vector
+# `W[numerical_models]`, which boosts the priors of experts whose underlying
+# concepts appear in the 6 models' physics (e.g. S/L Ratio expert #17,
+# Horizontal Layering expert #18, Von Mises Stress expert #12, etc.).
+EXPERT_CATEGORY = [
+    "phase_properties",            # 0  Phase Field Method
+    "phase_properties",            # 1  Order Parameter Eta
+    "phase_properties",            # 2  Order Parameter Phi
+    "electrochemical_kinetics",    # 3  Chemical Free Energy
+    "mechanical_constraints",      # 4  Mechanical Free Energy
+    "phase_properties",            # 5  Gradient Energy Coefficient
+    "structural_geometry",         # 6  Solid-Liquid Interface
+    "structural_geometry",         # 7  Dendrite Length Metric
+    "structural_geometry",         # 8  Dendrite Area Metric
+    "mechanical_constraints",      # 9  Young's Modulus Interpolation
+    "mechanical_constraints",      # 10 Poisson's Ratio
+    "mechanical_constraints",      # 11 Eigenstrain
+    "mechanical_constraints",      # 12 Von Mises Stress
+    "mechanical_constraints",      # 13 Elastic Strain Energy
+    "electrochemical_kinetics",    # 14 Butler-Volmer Kinetics
+    "electrochemical_kinetics",    # 15 Overpotential
+    "electrochemical_kinetics",    # 16 Ionic Concentration
+    "structural_geometry",         # 17 Solid-Liquid Ratio (S/L)
+    "structural_geometry",         # 18 Horizontal Layering Geometry
+    "structural_geometry",         # 19 Vertical Stripe Geometry
+    "structural_geometry",         # 20 Random Inclusion Geometry
+    "electrochemical_kinetics",    # 21 Nucleation Perturbation
+    "phase_properties",            # 22 LLZO Solid Electrolyte
+    "phase_properties",            # 23 LiPF6 Liquid Electrolyte
+    "phase_properties",            # 24 Lithium Metal Anode
+    "mechanical_constraints",      # 25 Mechanical Suppression
+    "structural_geometry",         # 26 Geometric Confinement
+    "phase_properties",            # 27 Multiphysics Coupling
+    "mechanical_constraints",      # 28 Finite Element Analysis
+    "electrochemical_kinetics",    # 29 Thermodynamic Equilibrium
+    "electrochemical_kinetics",    # 30 Dead Lithium Formation
+    "electrochemical_kinetics",    # 31 Cycle Life Degradation
+]
+
+@st.cache_resource(show_spinner=False)
+def get_category_anchors() -> Tuple[List[str], np.ndarray]:          # Eq. (1)
+    model = load_embedding_model()
+    rows = []
+    for k in FOUR_CATEGORIES:
+        texts = [c.replace("_", " ") for c in CATEGORY_SEEDS[k]] or [CATEGORY_DISPLAY[k]]
+        emb = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+        mu = emb.mean(axis=0)
+        rows.append(mu / (np.linalg.norm(mu) + 1e-9))
+    return FOUR_CATEGORIES, np.stack(rows)
+
+def soft_category_membership(term: str, beta: float = 8.0) -> Dict[str, float]:   # Eq. (2)
+    try:
+        keys, A = get_category_anchors()
+        t = load_embedding_model().encode(
+            term.replace("_", " "), show_progress_bar=False, convert_to_numpy=True
+        )
+        t = t / (np.linalg.norm(t) + 1e-9)
+        z = beta * (A @ t)
+        e = np.exp(z - z.max())
+        return dict(zip(keys, e / e.sum()))
+    except Exception:
+        hard = categorize_dendrite_concept(term)
+        # v6.3: distribute the residual mass evenly across the other N-1
+        # categories (was hardcoded `0.1 / 3` for the 4-pillar case).
+        residual = 0.1 / max(1, (len(FOUR_CATEGORIES) - 1))
+        return {k: (0.9 if k == hard else residual) for k in FOUR_CATEGORIES}
+
+def allocate_category_weights(
+    raw: Dict[str, float], alpha: float = 0.25
+) -> Dict[str, float]:                                              # Eq. (4)
+    # v6.3: denominator is now `len(FOUR_CATEGORIES) * alpha` (was `4 * alpha`)
+    # so the formula generalizes to the 5-pillar case.
+    n_cats = len(FOUR_CATEGORIES)
+    tot = n_cats * alpha + sum(raw.get(k, 0.0) for k in FOUR_CATEGORIES)
+    return {k: (alpha + raw.get(k, 0.0)) / tot for k in FOUR_CATEGORIES}
+
+def concentration_of(W: Dict[str, float]) -> float:                 # Eq. (5)
+    H = -sum(w * math.log(w) for w in W.values() if w > 1e-12)
+    # v6.3: normalize by log(N) where N is the number of active categories.
+    return float(np.clip(1.0 - H / math.log(len(FOUR_CATEGORIES)), 0.0, 1.0))
+
+def compute_query_category_weights(
+    query: str,
+    primary_problem: Optional[BatteryProblem] = None,
+) -> Tuple[Dict[str, float], float, int]:                           # Eqs. (3),(4),(5),(7)
+    q = query.lower()
+    raw = {k: 0.0 for k in FOUR_CATEGORIES}
+
+    # 1. Keyword-based problem detection (GENERAL excluded -> fixes dilution)
+    for p, kws in FallbackAnalyzer.PROBLEM_KEYWORDS.items():
+        if p == BatteryProblem.GENERAL:
+            continue
+        hits = sum(1 for kw in kws if kw in q)
+        if hits:
+            cat = PROBLEM_TO_CATEGORY.get(p)
+            if cat:
+                raw[cat] += hits
+
+    # 2. Problem-definition mass injection
+    if primary_problem is not None:
+        pdef = DENDRITE_RESEARCH_PROBLEMS.get(primary_problem)
+        if pdef is not None:
+            for concept in pdef.key_concepts:
+                cat = categorize_dendrite_concept(concept)
+                if cat in raw:
+                    raw[cat] += 1.0
+            for concept in (
+                pdef.relevant_descriptors
+                + pdef.relevant_phenomena
+                + pdef.relevant_properties
+            ):
+                cat = categorize_dendrite_concept(concept)
+                if cat in raw:
+                    raw[cat] += 0.5
+
+    # 3. Soft term evidence from extracted concepts
+    for term in extract_dendrite_concepts_from_text(q):
+        for k, m in soft_category_membership(term).items():
+            raw[k] += m
+
+    W = allocate_category_weights(raw)
+    c = concentration_of(W)
+    K = 2 + int(round(2 * c))                                      # K in {2,3,4}
+    return W, c, K
+
+def render_category_weight_gauge(
+    W: Dict[str, float], c: float, container=None
+) -> None:
+    if container is None:
+        container = st
+    # v6.3.2 FIX: was `container.columns(4)` + `zip(cols, FOUR_CATEGORIES)`
+    # which silently dropped the 5th category (numerical_models) because
+    # zip truncates to the shorter iterable. Now creates exactly as many
+    # columns as there are categories.
+    n_cats = len(FOUR_CATEGORIES)
+    cols = container.columns(n_cats)
+    for col, k in zip(cols, FOUR_CATEGORIES):
+        col.metric(CATEGORY_DISPLAY[k], f"{W.get(k, 0.25):.2f}")
+    container.caption(
+        f"Pillar concentration c={c:.2f} -> subgraph depth K={2 + int(round(2*c))}"
+    )
+
+# ============================================================================
+# QDWA CHART CUSTOMIZATION HELPERS (Publication-Quality)
+# ----------------------------------------------------------------------------
+# v6.2 FIX: Panel returns a dict; never writes to a widget-backed session key.
+# ============================================================================
+
+def render_qdwa_customization_panel() -> Dict[str, Any]:
+    """Comprehensive customization panel for QDWA visualizations.
+
+    Returns a dict consumed directly by the caller. All widget keys are
+    seeded by ``init_widget_defaults()`` at the top of ``main()``.
+    """
+
+    def _reset_qdwa_defaults() -> None:
+        for k in (
+            "qdwa_cmap",
+            "qdwa_post_font_size",
+            "qdwa_post_title_size",
+            "qdwa_post_font_family",
+            "qdwa_post_sankey_pad",
+            "qdwa_post_sankey_thick",
+            "qdwa_post_sankey_opacity",
+            "qdwa_post_bar_text_pos",
+            "qdwa_post_bar_text_size",
+            "qdwa_sim_alpha",
+        ):
+            st.session_state[k] = _MT_WIDGET_DEFAULTS[k]
+
+    with st.expander("🎨 QDWA Visualization Customization", expanded=False):
+        st.markdown("**Colormap & Theme**")
+        col1, col2 = st.columns(2)
+        with col1:
+            # Widget with key="qdwa_cmap" owns that session key.
+            qdwa_cmap_selected = st.selectbox(
+                "Colormap (QDWA)",
+                options=list(SUPPORTED_COLORMAPS.keys()),
+                key="qdwa_cmap",
+            )
+        with col2:
+            st.checkbox("Reverse Colormap", key="qdwa_cmap_reverse")
+
+        st.markdown("**Typography**")
+        col3, col4, col5 = st.columns(3)
+        with col3:
+            st.slider("Font Size", 8, 24, key="qdwa_post_font_size")
+        with col4:
+            st.slider("Title Size", 12, 32, key="qdwa_post_title_size")
+        with col5:
+            st.selectbox(
+                "Font Family",
+                [
+                    "Inter, Segoe UI, Roboto, sans-serif",
+                    "Arial, Helvetica, sans-serif",
+                    "Georgia, serif",
+                    "Courier New, monospace",
+                ],
+                key="qdwa_post_font_family",
+            )
+
+        st.markdown("**Sankey Settings**")
+        col6, col7, col8 = st.columns(3)
+        with col6:
+            st.slider("Node Padding", 5, 50, key="qdwa_post_sankey_pad")
+        with col7:
+            st.slider("Node Thickness", 10, 40, key="qdwa_post_sankey_thick")
+        with col8:
+            st.slider("Link Opacity", 0.1, 1.0, step=0.05,
+                      key="qdwa_post_sankey_opacity")
+
+        st.markdown("**Bar Chart Settings**")
+        col9, col10 = st.columns(2)
+        with col9:
+            st.selectbox(
+                "Text Position",
+                ["outside", "inside", "auto", "none"],
+                key="qdwa_post_bar_text_pos",
+            )
+        with col10:
+            st.slider("Text Size", 6, 16, key="qdwa_post_bar_text_size")
+
+        st.markdown("**Hybrid Similarity (v6.3.5)**")
+        st.slider(
+            "Categorical weight α (0=numeric only, 1=categorical only)",
+            0.0, 1.0, 0.4, 0.05,
+            key="qdwa_sim_alpha",
+            help=(
+                "Convex combination weight between numeric and categorical "
+                "similarity blocks. α=0 reproduces the old numeric-only cosine; "
+                "α=0.4 treats geometry as a modifier of physics (default); "
+                "α=1 uses structural (categorical) similarity only."
+            ),
+        )
+
+        # --- Inline colormap preview (uses widget return value) ---
+        preview_cmap = qdwa_cmap_selected
+        colors = get_colormap_colors(preview_cmap.replace("_r", ""), 10)
+        st.markdown(
+            "<div style='display:flex; height:15px; border-radius:3px; "
+            "overflow:hidden;'>"
+            + "".join(f"<div style='flex:1; background:{c};'></div>" for c in colors)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.button(
+            "🔄 Reset to Defaults",
+            key="qdwa_post_reset",
+            on_click=_reset_qdwa_defaults,
+        )
+
+    return {
+        "cmap": qdwa_cmap_selected,
+        "font_size": st.session_state.get("qdwa_post_font_size", 11),
+        "title_size": st.session_state.get("qdwa_post_title_size", 15),
+        "font_family": st.session_state.get(
+            "qdwa_post_font_family", "Inter, Segoe UI, Roboto, sans-serif"
+        ),
+        "sankey_node_pad": st.session_state.get("qdwa_post_sankey_pad", 20),
+        "sankey_node_thickness": st.session_state.get("qdwa_post_sankey_thick", 25),
+        "sankey_link_opacity": st.session_state.get("qdwa_post_sankey_opacity", 0.4),
+        "bar_text_position": st.session_state.get("qdwa_post_bar_text_pos", "outside"),
+        "bar_text_size": st.session_state.get("qdwa_post_bar_text_size", 10),
+        "sim_alpha": st.session_state.get("qdwa_sim_alpha", 0.4),
+    }
+
+def apply_qdwa_pub_style(fig, is_axial=True):
+    """Applies session-state styling to Plotly figures for publication quality."""
+    font = st.session_state.get("qdwa_font", "Inter, sans-serif")
+    title_size = st.session_state.get("qdwa_title_size", 18)
+    tick_size = st.session_state.get("qdwa_tick_size", 12)
+    mt = st.session_state.get("qdwa_margin_t", 50)
+    mb = st.session_state.get("qdwa_margin_b", 40)
+    ml = st.session_state.get("qdwa_margin_l", 60)
+    mr = st.session_state.get("qdwa_margin_r", 40)
+    tl = st.session_state.get("qdwa_tick_len", 5)
+
+    fig.update_layout(
+        font=dict(family=font, size=tick_size, color="#1e293b"),
+        title_font=dict(family=font, size=title_size, color="#0f172a"),
+        margin=dict(l=ml, r=mr, t=mt, b=mb),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    if is_axial:
+        fig.update_xaxes(tickfont=dict(size=tick_size, family=font, color="#475569"), ticklen=tl, showgrid=True, gridcolor="rgba(128,128,128,0.15)", zeroline=False)
+        fig.update_yaxes(tickfont=dict(size=tick_size, family=font, color="#475569"), ticklen=tl, showgrid=True, gridcolor="rgba(128,128,128,0.15)", zeroline=False)
+    return fig
+
+# ============================================================================
+# QDWA CHART RENDERING FUNCTIONS
+# ============================================================================
+
+def render_qdwa_bar(df: pd.DataFrame, scale: List[str]):
+    """Horizontal bar chart; major category gets a glow border."""
+    sorted_df = df.sort_values("Weight", ascending=True)
+    colors = []
+    border_colors = []
+    border_widths = []
+    lw = st.session_state.get("qdwa_line_width", 1.5)
+
+    for _, row in sorted_df.iterrows():
+        colors.append(row["Color"])
+        if row["Is Major"]:
+            border_colors.append("#FFD700")
+            border_widths.append(lw * 2)
+        else:
+            border_colors.append(row["Color"])
+            border_widths.append(lw)
+
+    fig = go.Figure(go.Bar(
+        x=sorted_df["Weight"], y=sorted_df["Short Name"], orientation="h",
+        marker_color=colors, marker_line_color=border_colors, marker_line_width=border_widths,
+        text=sorted_df["Weight"].map("{:.1%}".format), textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Weight: %{x:.4f}<extra></extra>",
+    ))
+
+    major_row = sorted_df[sorted_df["Is Major"]].iloc[0]
+    fig.add_annotation(x=major_row["Weight"], y=major_row["Short Name"], text="⭐ MAJOR",
+                       showarrow=True, arrowhead=2, ax=40, ay=0,
+                       font=dict(size=13, color="#FFD700", family="sans-serif"))
+
+    fig.update_layout(title="QDWA Category Weights (Major Highlighted ⭐)",
+                      xaxis_title="Weight", xaxis_range=[0, max(sorted_df["Weight"]) * 1.35],
+                      height=300, showlegend=False)
+
+    st.plotly_chart(apply_qdwa_pub_style(fig), width="stretch")
+
+def render_qdwa_donut(df: pd.DataFrame, scale: List[str]):
+    """Donut chart; major slice is 'exploded' outward."""
+    cats = list(df["Short Name"])
+    weights = list(df["Weight"])
+    colors = list(df["Color"])
+    major_cat = df.loc[df["Is Major"], "Short Name"].iloc[0]
+
+    pull = [0.12 if c == major_cat else 0 for c in cats]
+
+    fig = go.Figure(go.Pie(
+        labels=[f"{c}\n({w:.1%})" for c, w in zip(cats, weights)],
+        values=weights,
+        marker_colors=colors,
+        hole=0.50,
+        pull=pull,
+        textfont=dict(size=13),
+        hovertemplate="<b>%{label}</b><br>Weight: %{value:.4f}<extra></extra>",
+    ))
+
+    fig.add_annotation(
+        text=f"⭐ {major_cat}",
+        x=0.5, y=0.5,
+        font=dict(size=16, color="#FFD700", family="sans-serif"),
+        showarrow=False,
+    )
+
+    fig.update_layout(
+        title="QDWA Weight Distribution (Donut)",
+        height=400,
+        margin=dict(l=20, r=20, t=50, b=20),
+        showlegend=True,
+        legend=dict(font=dict(size=12)),
+    )
+
+    st.plotly_chart(apply_qdwa_pub_style(fig, is_axial=False), width="stretch")
+
+def render_qdwa_radar(df: pd.DataFrame, scale: List[str]):
+    """Spider chart — excellent for showing which category dominates."""
+    cats = list(df["Short Name"])
+    weights = list(df["Weight"])
+    colors = list(df["Color"])
+    n = len(cats)
+
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
+    weights_closed = weights + [weights[0]]
+    theta_closed = theta + [theta[0]]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatterpolar(
+        r=weights_closed,
+        theta=theta_closed,
+        fill="toself",
+        fillcolor="rgba(99,102,241,0.25)",
+        line=dict(color="#6366F1", width=2),
+        name="Weight profile",
+        hovertemplate="<b>%{theta}</b><br>Weight: %{r:.4f}<extra></extra>",
+    ))
+
+    for i in range(n):
+        fig.add_trace(go.Scatterpolar(
+            r=[weights[i]],
+            theta=[np.degrees(theta[i])],
+            mode="markers+text",
+            marker=dict(size=14, color=colors[i], line=dict(width=2, color="white")),
+            text=[f"{weights[i]:.1%}"],
+            textposition="top center",
+            textfont=dict(size=12, color=colors[i]),
+            name=cats[i],
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, max(weights) * 1.4]),
+            angularaxis=dict(tickfont=dict(size=12)),
+        ),
+        showlegend=False,
+        title="QDWA Weight Radar",
+        height=420,
+        margin=dict(l=60, r=60, t=50, b=40),
+    )
+
+    st.plotly_chart(apply_qdwa_pub_style(fig, is_axial=False), width="stretch")
+
+def render_qdwa_sankey(df: pd.DataFrame, query: str, scale: List[str]):
+    """Sankey diagram: Query → 4 Categories."""
+    labels = [f"Query:\n{query[:40]}…"] + list(df["Short Name"])
+    sources = [0, 0, 0, 0]
+    targets = [1, 2, 3, 4]
+    values = list(df["Weight"])
+    colors = list(df["Color"])
+
+    node_colors = ["#6366F1"] + colors
+
+    link_colors = []
+    for c in colors:
+        if isinstance(c, str) and c.startswith('#') and len(c) == 7:
+            r = int(c[1:3], 16)
+            g = int(c[3:5], 16)
+            b = int(c[5:7], 16)
+            link_colors.append(f"rgba({r},{g},{b},0.5)")
+        else:
+            link_colors.append(c)
+
+    fig = go.Figure(data=[go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=20, thickness=30,
+            label=labels,
+            color=node_colors,
+        ),
+        link=dict(
+            source=sources, target=targets,
+            value=values, color=link_colors,
+        ),
+    )])
+
+    fig.update_layout(
+        title="QDWA Weight Flow (Query → Categories)",
+        height=350,
+        margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(size=13),
+    )
+
+    st.plotly_chart(apply_qdwa_pub_style(fig, is_axial=False), width="stretch")
+
+
+def render_qdwa_sankey_twoway(query: str, df: pd.DataFrame, scale: List[str]):
+    """
+    Two-Way Sankey: Query -> Extracted Terms -> 4 Categories -> Final Weights
+    """
+    terms = extract_dendrite_concepts_from_text(query.lower())
+    if not terms:
+        terms = ["general_dendrite_growth"]
+
+    term_memberships = {}
+    for t in terms:
+        term_memberships[t] = soft_category_membership(t)
+
+    labels = [f"Query:\n{query[:35]}..."]
+    term_labels = [t.replace("_", " ").title() for t in terms]
+    labels.extend(term_labels)
+    cat_labels = list(df["Short Name"])
+    labels.extend(cat_labels)
+    labels.append("Final\nWeights")
+
+    sources, targets, values, link_colors = [], [], [], []
+
+    q_idx = 0
+    for i, t in enumerate(terms):
+        sources.append(q_idx)
+        targets.append(1 + i)
+        values.append(1.0 / len(terms))
+        link_colors.append("rgba(99, 102, 241, 0.3)")
+
+    for i, t in enumerate(terms):
+        mems = term_memberships[t]
+        for j, cat_key in enumerate(FOUR_CATEGORIES):
+            val = mems.get(cat_key, 0)
+            if val > 0.05:
+                sources.append(1 + i)
+                targets.append(1 + len(terms) + j)
+                values.append(val)
+                c = CATEGORY_COLORS.get(cat_key, "#64748b")
+                if isinstance(c, str) and c.startswith('#') and len(c) == 7:
+                    r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+                    link_colors.append(f"rgba({r},{g},{b},0.4)")
+                else:
+                    link_colors.append("rgba(100,100,100,0.4)")
+
+    for j, (_, row) in enumerate(df.iterrows()):
+        sources.append(1 + len(terms) + j)
+        targets.append(1 + len(terms) + len(FOUR_CATEGORIES))
+        values.append(row["Weight"])
+        c = row["Color"]
+        if isinstance(c, str) and c.startswith('#') and len(c) == 7:
+            r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+            link_colors.append(f"rgba({r},{g},{b},0.7)")
+        else:
+            link_colors.append("rgba(100,100,100,0.7)")
+
+    node_colors = ["#6366F1"] + ["#94A3B8"] * len(terms) + list(df["Color"]) + ["#10B981"]
+
+    fig = go.Figure(data=[go.Sankey(
+        arrangement="snap",
+        node=dict(pad=20, thickness=25, label=labels, color=node_colors,
+                  line=dict(color="#fff", width=1)),
+        link=dict(source=sources, target=targets, value=values, color=link_colors)
+    )])
+
+    fig.update_layout(
+        title_text="QDWA Two-Way Flow: Query → Terms → Categories → Weights",
+        height=500,
+        font=dict(size=13, color="#1e293b")
+    )
+    st.plotly_chart(apply_qdwa_pub_style(fig, is_axial=False), width="stretch")
+
+def render_qdwa_chord(df: pd.DataFrame, scale: List[str]):
+    """
+    Chord-style diagram: radial bar (chord approximation) plus an interaction heatmap.
+    """
+    cats = list(df["Short Name"])
+    weights = list(df["Weight"])
+    colors = list(df["Color"])
+    n = len(cats)
+
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    width = 2 * np.pi / n * 0.75
+
+    fig = go.Figure()
+    for i in range(n):
+        fig.add_trace(go.Barpolar(
+            r=[weights[i]],
+            theta=[np.degrees(theta[i])],
+            width=[np.degrees(width)],
+            marker_color=colors[i],
+            marker_line_color="white",
+            marker_line_width=2,
+            name=cats[i],
+            hoverinfo="text",
+            text=f"{cats[i]}: {weights[i]:.1%}",
+        ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=False, range=[0, max(weights) * 1.3]),
+            angularaxis=dict(visible=False),
+        ),
+        showlegend=True,
+        title="QDWA Category Chord (Radial)",
+        height=420,
+        margin=dict(l=40, r=40, t=50, b=40),
+    )
+    st.plotly_chart(apply_qdwa_pub_style(fig, is_axial=False), width="stretch")
+
+    st.markdown("#### Category Interaction Heatmap")
+    render_qdwa_heatmap(df, scale)
+
+def render_qdwa_heatmap(df: pd.DataFrame, scale: List[str]):
+    """
+    Heatmap showing:
+      - Row 1: Final weights
+      - Row 2: Raw cosine similarities
+      - Row 3: Keyword hit counts (normalized)
+    """
+    cats = list(df["Short Name"])
+    matrix = np.array([
+        list(df["Weight"]),
+        list(df["Raw Similarity"]),
+        list(df["Keyword Hits"] / (df["Keyword Hits"].max() + 1)),
+    ])
+
+    fig = go.Figure(go.Heatmap(
+        z=matrix,
+        x=cats,
+        y=["Final Weight", "Raw Cosine Sim", "Keyword Hits (norm)"],
+        colorscale=scale,
+        texttemplate="%{z:.3f}",
+        textfont=dict(size=14, color="white"),
+        hovertemplate=(
+            "<b>%{y}</b> × <b>%{x}</b><br>Value: %{z:.4f}<extra></extra>"
+        ),
+        showscale=True,
+        colorbar=dict(title="Value"),
+    ))
+
+    major_idx = df.index[df["Is Major"]][0]
+    fig.add_vrect(
+        x0=major_idx - 0.45, x1=major_idx + 0.45,
+        line_width=3, line_color="#FFD700",
+        fillcolor="#FFD700", opacity=0.08,
+    )
+
+    fig.update_layout(
+        title="QDWA Weight Decomposition Heatmap (⭐ = major column)",
+        height=260,
+        margin=dict(l=140, r=40, t=50, b=30),
+        xaxis_side="bottom",
+    )
+
+    st.plotly_chart(apply_qdwa_pub_style(fig), width="stretch")
+
+# ============================================================================
+# QUERY ANALYSIS DATA STRUCTURES
+# ============================================================================
+@dataclass
+class ConceptPriority:
+    concept_name: str
+    concept_type: str
+    composite_score: float
+    direct_score: float
+    problem_affinity_score: float
+    causal_path_score: float
+    is_explicitly_mentioned: bool
+    is_inferred: bool
+    inference_reason: str = ""
+    ppr_score: float = 0.0
+    qc_pmi: float = 0.0
+    semantic_resonance: float = 0.0
+    cde: float = 0.0
+    causal_proximity: float = 0.0
+
+    def to_dict(self) -> Dict:
+        return {**self.__dict__, "score": round(self.composite_score, 3)}
+
+@dataclass
+class QueryAnalysisResult:
+    original_query: str
+    normalized_query: str
+    primary_problem: BatteryProblem
+    secondary_problems: List[BatteryProblem]
+    problem_confidences: Dict[str, float]
+    explicitly_mentioned: List[str]
+    inferred_concepts: List[str]
+    all_relevant_concepts: List[str]
+    concept_priorities: Dict[str, ConceptPriority] = field(default_factory=dict)
+    query_type: str = "general"
+    emphasis_direction: str = "cause"
+    comparison_pairs: List[Tuple[str, str]] = field(default_factory=list)
+    subgraph_depth: int = 2
+    priority_threshold: float = 0.3
+    focus_nodes: List[str] = field(default_factory=list)
+    bridge_nodes: List[str] = field(default_factory=list)
+    suggested_layout: str = "force"
+    highlight_paths: List[List[str]] = field(default_factory=list)
+    visualization_focus: List[str] = field(default_factory=list)
+    reasoning_chain: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    category_weights: Dict[str, float] = field(default_factory=dict)
+    concentration: float = 0.0
+
+    def get_top_concepts(self, n: int = 10) -> List[ConceptPriority]:
+        return sorted(self.concept_priorities.values(), key=lambda x: x.composite_score, reverse=True)[:n]
+
+    def get_concepts_above_threshold(self, threshold: float = None) -> List[str]:
+        thresh = threshold or self.priority_threshold
+        return [name for name, cp in self.concept_priorities.items() if cp.composite_score >= thresh]
+
+# ============================================================================
+# LLM QUERY ANALYZERS (Fallback, OpenAI, Local)
+# ============================================================================
+class LLMQueryAnalyzer(ABC):
+    @abstractmethod
+    def analyze_query(self, query: str, ontology: Any) -> QueryAnalysisResult:
+        pass
+    @abstractmethod
+    def is_available(self) -> bool:
+        pass
+
+class FallbackAnalyzer(LLMQueryAnalyzer):
+    PROBLEM_KEYWORDS = {
+        BatteryProblem.GEOMETRY_IMPACT: {"geometry", "layer", "stripe", "inclusion", "s/l ratio", "solid-liquid ratio", "configuration", "horizontal", "vertical", "random", "domain"},
+        BatteryProblem.PHASE_PROPERTIES: {"order parameter", "eta", "phi", "young's modulus", "modulus", "poisson", "conductivity", "gradient energy", "interpolation", "phase field"},
+        BatteryProblem.ELECTROCHEMICAL_KINETICS: {"butler-volmer", "overpotential", "concentration", "nucleation", "chemical free energy", "kinetics", "ion"},
+        BatteryProblem.MECHANICAL_SUPPRESSION: {"von mises", "stress", "eigenstrain", "elastic", "mechanical free energy", "suppression", "strain energy", "confinement"},
+        BatteryProblem.GENERAL: {"dendrite", "lithium", "electrolyte", "phase field"},
+    }
+    def is_available(self) -> bool:
+        return True
+
+    def analyze_query(self, query: str, ontology: Any) -> QueryAnalysisResult:
+        q = query.lower().strip()
+        problem_scores = {p: sum(1 for kw in kws if kw in q) for p, kws in self.PROBLEM_KEYWORDS.items()}
+        primary = max(problem_scores, key=problem_scores.get) if sum(problem_scores.values()) > 0 else BatteryProblem.GENERAL
+        secondary = [p for p, s in sorted(problem_scores.items(), key=lambda x: -x[1]) if s > 0 and p != primary][:2]
+
+        W, c, K = compute_query_category_weights(query, primary_problem=primary)
+
+        explicitly_mentioned = []
+        for canonical, node in ontology.concepts.items():
+            if canonical.replace("_", " ") in q or any(syn.replace("_", " ") in q for syn in node.synonyms):
+                explicitly_mentioned.append(canonical)
+
+        inferred = []
+        if primary != BatteryProblem.GENERAL:
+            pdef = DENDRITE_RESEARCH_PROBLEMS[primary]
+            for concept in pdef.get_ontology_concepts():
+                if concept not in explicitly_mentioned and concept in ontology.concepts:
+                    inferred.append(concept)
+
+        all_relevant = list(dict.fromkeys(explicitly_mentioned + inferred))
+        priorities = {}
+        pdef = DENDRITE_RESEARCH_PROBLEMS.get(primary, DENDRITE_RESEARCH_PROBLEMS[BatteryProblem.GENERAL])
+        problem_concept_set = pdef.get_ontology_concepts()
+
+        for concept in all_relevant:
+            is_explicit = concept in explicitly_mentioned
+            priorities[concept] = ConceptPriority(
+                concept_name=concept, concept_type=ontology.get_concept_type(concept).value,
+                composite_score=(1.0 if is_explicit else 0.6) * 0.5 + (1.0 if concept in problem_concept_set else 0.4) * 0.5,
+                direct_score=1.0 if is_explicit else 0.6, problem_affinity_score=1.0 if concept in problem_concept_set else 0.4,
+                causal_path_score=0.5, is_explicitly_mentioned=is_explicit, is_inferred=not is_explicit,
+                inference_reason="problem_affinity" if not is_explicit else "explicit_mention"
+            )
+
+        query_type = "general"
+        if any(w in q for w in ["compare", "vs", "versus", "difference"]):
+            query_type = "comparison"
+        elif any(w in q for w in ["why", "cause", "reason", "lead to"]):
+            query_type = "causal"
+        elif any(w in q for w in ["how", "improve", "enhance", "optimize", "strategy"]):
+            query_type = "solution"
+
+        highlight_paths = [[src, tgt] for src, rel, tgt in pdef.key_relationships if src in ontology.concepts and tgt in ontology.concepts]
+        total = max(sum(problem_scores.values()), 1)
+
+        return QueryAnalysisResult(
+            original_query=query, normalized_query=q, primary_problem=primary, secondary_problems=secondary,
+            problem_confidences={p.value: s / total for p, s in problem_scores.items()},
+            explicitly_mentioned=explicitly_mentioned, inferred_concepts=inferred, all_relevant_concepts=all_relevant,
+            concept_priorities=priorities, query_type=query_type, emphasis_direction="cause" if query_type == "causal" else "neutral",
+            subgraph_depth=K, priority_threshold=0.3, focus_nodes=explicitly_mentioned[:5], bridge_nodes=inferred[:3],
+            suggested_layout="force" if query_type != "comparison" else "bisected", highlight_paths=highlight_paths,
+            visualization_focus=pdef.visualization_focus, reasoning_chain=[f"Query normalized: '{q}'", f"Primary problem: {primary.value}"],
+            confidence=min(sum(problem_scores.values()) / 3.0, 1.0),
+            category_weights=W, concentration=c,
+        )
+
+class OpenAIQueryAnalyzer(LLMQueryAnalyzer):
+    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini"):
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.model = model
+        self._client = None
+        self._pending_new_concepts = []
+        self._pending_new_relationships = []
+
+    def _get_client(self):
+        if self._client is None and self.api_key and OpenAI is not None:
+            self._client = OpenAI(api_key=self.api_key)
+        return self._client
+
+    def is_available(self) -> bool:
+        return self._get_client() is not None
+
+    def analyze_query(self, query: str, ontology: Any) -> QueryAnalysisResult:
+        client = self._get_client()
+        if client is None:
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        concept_list = list(ontology.concepts.keys())[:50]
+        system_prompt = """You are an expert in dendrite growth in partitioned electrolytes (phase-field modeling of lithium-metal electrodes with solid partitions). Analyze the user's query and return ONLY valid JSON with:
+        1. "primary_problem": One of: geometry_impact, phase_properties, electrochemical_kinetics, mechanical_suppression, general, multi_problem
+        2. "explicitly_mentioned": List of canonical concept names from the query (use snake_case)
+        3. "inferred_concepts": List of additional relevant concepts the query implies
+        4. "query_type": One of: causal, comparison, solution, definition, general
+        5. "highlight_paths": List of [source, target] concept pairs to highlight
+        6. "reasoning_chain": List of strings explaining analysis steps
+        7. "new_concepts": List of objects with "name" (snake_case), "type" (material/property/phenomenon/process/method/parameter/microstructure), "definition", "synonyms" (list)
+        8. "new_relationships": List of [source, relationship_type, target, confidence] for NEW relationships between EXISTING concepts."""
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Analyze: '{query}'. Available concepts: {', '.join(concept_list)}"}],
+                temperature=0.1,
+                max_tokens=1500,
+                response_format={"type": "json_object"}
+            )
+            parsed = json.loads(response.choices[0].message.content)
+            self._pending_new_concepts = parsed.get("new_concepts", [])
+            self._pending_new_relationships = parsed.get("new_relationships", [])
+            problem_map = {p.value: p for p in BatteryProblem}
+            primary = problem_map.get(parsed.get("primary_problem", "general"), BatteryProblem.GENERAL)
+            W, c, K = compute_query_category_weights(query, primary_problem=primary)
+            explicitly_mentioned = [c for c in parsed.get("explicitly_mentioned", []) if c in ontology.concepts]
+            inferred = [c for c in parsed.get("inferred_concepts", []) if c in ontology.concepts and c not in explicitly_mentioned]
+            priorities = {c: ConceptPriority(c, ontology.get_concept_type(c).value, 0.9 if c in explicitly_mentioned else 0.6, 1.0 if c in explicitly_mentioned else 0.5, 0.8, 0.5, c in explicitly_mentioned, c not in explicitly_mentioned, "llm_inferred") for c in list(dict.fromkeys(explicitly_mentioned + inferred))}
+            return QueryAnalysisResult(
+                original_query=query, normalized_query=query.lower().strip(), primary_problem=primary, secondary_problems=[],
+                problem_confidences={}, explicitly_mentioned=explicitly_mentioned, inferred_concepts=inferred, all_relevant_concepts=list(dict.fromkeys(explicitly_mentioned + inferred)),
+                concept_priorities=priorities, query_type=parsed.get("query_type", "general"), emphasis_direction="cause",
+                subgraph_depth=K, priority_threshold=0.3, focus_nodes=explicitly_mentioned[:5], bridge_nodes=inferred[:3],
+                suggested_layout="bisected" if parsed.get("query_type") == "comparison" else "force",
+                highlight_paths=[[p[0], p[1]] for p in parsed.get("highlight_paths", []) if len(p) >= 2],
+                visualization_focus=DENDRITE_RESEARCH_PROBLEMS[primary].visualization_focus,
+                reasoning_chain=parsed.get("reasoning_chain", ["LLM analysis completed"]), confidence=0.85,
+                category_weights=W, concentration=c,
+            )
+        except Exception as e:
+            st.warning(f"OpenAI analysis failed ({e}), falling back to rule-based.")
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+class LocalLLMQueryAnalyzer(LLMQueryAnalyzer):
+    def __init__(self, model_name: str = "distilgpt2"):
+        self.model_name = model_name
+        self._pipeline = None
+        self._loaded = False
+        self._pending_new_concepts = []
+        self._pending_new_relationships = []
+
+    def _load_model(self):
+        if self._loaded:
+            return
+        try:
+            if pipeline is None:
+                st.warning("transformers not installed; cannot use local LLM.")
+                return
+
+            st.info(f"⏳ Loading local model: `{self.model_name}`… (first run may take 1–2 min)")
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
+            # Pick a quantization strategy that fits the model size on a
+            # single 24 GB GPU:
+            #   * sub-1B / CPU           → fp32, no quantization
+            #   * ≤14B dense             → 8-bit (≈7–10 GB VRAM)
+            #   * ≥30B (Qwen3-30B-A3B / 32B) → 4-bit NF4 (≈18–22 GB VRAM)
+            #     The 30B-A3B MoE keeps only ~3B params active per token, so
+            #     even though it occupies 18 GB of VRAM the inference latency
+            #     is closer to a 7B dense model.
+            is_large_qwen3 = (
+                "Qwen3-30B" in self.model_name
+                or "Qwen3-32B" in self.model_name
+            )
+
+            load_kwargs: Dict[str, Any] = {}
+            if torch.cuda.is_available():
+                load_kwargs["torch_dtype"] = torch.float16
+                load_kwargs["device_map"] = "auto"
+                if is_large_qwen3:
+                    # 4-bit NF4 — mandatory for ≥30B on a 24 GB card.
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                    st.caption("📐 Using 4-bit NF4 quantization (large ≥30B model).")
+                else:
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_8bit=True
+                    )
+            else:
+                load_kwargs["torch_dtype"] = torch.float32
+                load_kwargs["device_map"] = None
+                if is_large_qwen3:
+                    st.warning(
+                        f"⚠️ `{self.model_name}` is a ≥30B model and you are on "
+                        "CPU. This will likely exhaust system RAM and is not "
+                        "recommended. Switch to a CUDA device or pick a smaller "
+                        "model from the sidebar."
+                    )
+
+            model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
+
+            self._pipeline = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=512,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            self._loaded = True
+            st.success(f"✅ Model `{self.model_name}` loaded!")
+
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load local model `{self.model_name}`: {e}")
+            self._loaded = False
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def is_available(self) -> bool:
+        self._load_model()
+        return self._loaded
+
+    def analyze_query(self, query: str, ontology: Any) -> QueryAnalysisResult:
+        if not self.is_available():
+            return FallbackAnalyzer().analyze_query(query, ontology)
+        prompt = f"[INST] You are an expert in dendrite growth in partitioned electrolytes (phase-field modeling of lithium-metal electrodes with solid partitions). Analyze: '{query}'. Return ONLY valid JSON with: primary_problem (one of geometry_impact, phase_properties, electrochemical_kinetics, mechanical_suppression, general, multi_problem), explicitly_mentioned (snake_case list), inferred_concepts (list), query_type, highlight_paths (list of [src, tgt]), reasoning_chain (list). [/INST]"
+        try:
+            result = self._pipeline(prompt)[0]["generated_text"]
+            json_match = re.search(r'\{.*\}', result, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                fake_openai = OpenAIQueryAnalyzer()
+                fake_openai._pending_new_concepts = parsed.get("new_concepts", [])
+                fake_openai._pending_new_relationships = parsed.get("new_relationships", [])
+                return fake_openai.analyze_query(query, ontology)
+        except Exception as e:
+            st.warning(f"Local LLM parsing failed: {e}")
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+    def unload_model(self) -> None:
+        if self._pipeline is not None:
+            if hasattr(self._pipeline, 'tokenizer'):
+                del self._pipeline.tokenizer
+            if hasattr(self._pipeline, 'model'):
+                del self._pipeline.model
+            del self._pipeline
+            self._pipeline = None
+        self._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ============================================================================
+# v6.4 — OLLAMA BACKEND QUERY ANALYZER (text-only LLMs)
+# ----------------------------------------------------------------------------
+# Calls a local Ollama server (default: http://localhost:11434) for any text
+# LLM already pulled via `ollama pull <tag>`.  No VRAM management needed —
+# Ollama handles GPU/CPU offloading internally.  Falls back gracefully to
+# `FallbackAnalyzer` if the server is down or the model is not pulled.
+# ============================================================================
+class OllamaQueryAnalyzer(LLMQueryAnalyzer):
+    """LLM analyzer backed by a local Ollama server.
+    Uses the `ollama` Python client to call models already pulled on the
+    host machine.  No VRAM management needed — Ollama handles it.
+    """
+    def __init__(self, model_tag: str):
+        self.model_tag = model_tag
+        self._pending_new_concepts: List[Any] = []
+        self._pending_new_relationships: List[Any] = []
+
+    def is_available(self) -> bool:
+        if not OLLAMA_AVAILABLE:
+            return False
+        return _ollama_has_model(self.model_tag)
+
+    def analyze_query(self, query: str, ontology: Any) -> QueryAnalysisResult:
+        if not self.is_available():
+            st.warning(
+                f"⚠️ Ollama model `{self.model_tag}` is not pulled locally. "
+                f"Run: `ollama pull {self.model_tag}`"
+            )
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        prompt = (
+            "You are an expert in dendrite growth in partitioned electrolytes "
+            "(phase-field modeling of lithium-metal electrodes with solid partitions). "
+            f"Analyze: '{query}'. Return ONLY valid JSON with:\n"
+            "  primary_problem (one of geometry_impact, phase_properties, "
+            "electrochemical_kinetics, mechanical_suppression, general, multi_problem),\n"
+            "  explicitly_mentioned (snake_case list of canonical concepts),\n"
+            "  inferred_concepts (list),\n"
+            "  query_type (causal|comparison|solution|definition|general),\n"
+            "  highlight_paths (list of [src, tgt]),\n"
+            "  reasoning_chain (list of strings).\n"
+        )
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            response = client.chat(
+                model=self.model_tag,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.1, "num_predict": 1500},
+                format="json",
+            )
+            content = _ollama_content(response)
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                # Reuse OpenAI result-builder for consistency
+                fake_openai = OpenAIQueryAnalyzer()
+                fake_openai._pending_new_concepts = parsed.get("new_concepts", [])
+                fake_openai._pending_new_relationships = parsed.get("new_relationships", [])
+                return fake_openai.analyze_query(query, ontology)
+            else:
+                st.warning("Ollama response did not contain JSON; falling back.")
+        except Exception as e:
+            st.warning(f"Ollama call failed: {e}")
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+    def unload_model(self) -> None:
+        # Ollama manages its own memory; ask it to unload this model.
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            client.generate(model=self.model_tag, keep_alive=0)
+        except Exception:
+            pass
+
+
+class VLMQueryAnalyzer(LLMQueryAnalyzer):
+    """
+    Multimodal (Vision-Language) query analyzer.
+
+    Supports the Qwen2.5-VL and Qwen3-VL series.  Default is
+    ``Qwen/Qwen2.5-VL-7B-Instruct`` (≈6 GB at 4-bit); the larger
+    ``Qwen/Qwen3-VL-30B-Instruct`` (≈19 GB) and
+    ``Qwen/Qwen3-VL-32B-Instruct`` (≈20 GB) variants can be selected from the
+    sidebar when the user has pulled them locally via ``ollama pull
+    qwen3-vl:30b`` / ``qwen3-vl:32b``.
+
+    The model is always loaded in 4-bit NF4 quantization so that even the
+    32B variant fits comfortably within ~20 GB of VRAM, leaving ample headroom
+    on a 24 GB card (e.g. RTX 3090 / 4090) for high-resolution image contexts
+    and SFT/LoRA adapters.
+
+    If the VLM cannot be loaded (missing dependencies, no GPU, OOM, ...) the
+    analyzer transparently falls back to :class:`FallbackAnalyzer`.
+    """
+
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
+        self.model_name = model_name
+        self.processor = None
+        self.model = None
+        self._loaded = False
+        self._pending_new_concepts: List[Any] = []
+        self._pending_new_relationships: List[Any] = []
+
+    def _load_model(self) -> None:
+        if self._loaded:
+            return
+        try:
+            if AutoProcessor is None or AutoModelForVision2Seq is None:
+                st.warning(
+                    "transformers version too old for VLM. Please upgrade: "
+                    "pip install --upgrade transformers accelerate pillow qwen-vl-utils"
+                )
+                return
+
+            st.info(f"⏳ Loading VLM: `{self.model_name}`… (may take 1–2 min)")
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
+
+            # 4-bit NF4 quantization is mandatory to leave VRAM for SFT/LoRA
+            # adapters and high-resolution image contexts on a 48 GB card.
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model_name,
+                device_map="auto",
+                quantization_config=quantization_config,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+            )
+            self._loaded = True
+            # Report actual VRAM headroom used so the user can confirm the
+            # chosen model fit on their card.
+            if "Qwen3-VL-32B" in self.model_name:
+                vram_msg = "~20 GB VRAM at 4-bit NF4 (24 GB card recommended)"
+            elif "Qwen3-VL-30B" in self.model_name:
+                vram_msg = "~19 GB VRAM at 4-bit NF4"
+            elif "7B" in self.model_name:
+                vram_msg = "~6 GB VRAM at 4-bit NF4"
+            else:
+                vram_msg = "loaded successfully"
+            st.success(f"✅ VLM `{self.model_name}` loaded! ({vram_msg})")
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load VLM `{self.model_name}`: {e}")
+            self._loaded = False
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def is_available(self) -> bool:
+        self._load_model()
+        return self._loaded
+
+    def _build_result_from_parsed(
+        self, parsed: Dict[str, Any], query: str, ontology: Any
+    ) -> "QueryAnalysisResult":
+        """Translate the VLM JSON response into a :class:`QueryAnalysisResult`.
+
+        Reuses :class:`FallbackAnalyzer` for safe concept-id resolution and
+        inference defaults, then overrides the fields the VLM was confident
+        about.  We do NOT recursively call OpenAIQueryAnalyzer (which would
+        re-issue a network/text LLM call and discard this parsed JSON).
+        """
+        base = FallbackAnalyzer().analyze_query(query, ontology)
+
+        # Primary problem -------------------------------------------------
+        raw_problem = (parsed.get("primary_problem") or "").strip().lower()
+        problem_map = {
+            "geometry_impact": BatteryProblem.GEOMETRY_IMPACT,
+            "phase_properties": BatteryProblem.PHASE_PROPERTIES,
+            "electrochemical_kinetics": BatteryProblem.ELECTROCHEMICAL_KINETICS,
+            "mechanical_suppression": BatteryProblem.MECHANICAL_SUPPRESSION,
+            "general": BatteryProblem.GENERAL,
+            "multi_problem": BatteryProblem.MULTI_PROBLEM,
+        }
+        if raw_problem in problem_map:
+            base.primary_problem = problem_map[raw_problem]
+
+        # Concept lists ---------------------------------------------------
+        explicitly_mentioned = parsed.get("explicitly_mentioned") or []
+        inferred_concepts = parsed.get("inferred_concepts") or []
+        if isinstance(explicitly_mentioned, list):
+            base.explicitly_mentioned = [str(c) for c in explicitly_mentioned]
+        if isinstance(inferred_concepts, list):
+            base.inferred_concepts = [str(c) for c in inferred_concepts]
+
+        # Query type ------------------------------------------------------
+        qtype = parsed.get("query_type")
+        if isinstance(qtype, str) and qtype.strip():
+            base.query_type = qtype.strip()
+
+        # Highlight paths -------------------------------------------------
+        highlight_paths = parsed.get("highlight_paths") or []
+        if isinstance(highlight_paths, list):
+            cleaned: List[Tuple[str, str]] = []
+            for item in highlight_paths:
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and all(isinstance(x, str) for x in item)
+                ):
+                    cleaned.append((item[0], item[1]))
+            if cleaned:
+                base.highlight_paths = cleaned
+
+        # Reasoning chain --------------------------------------------------
+        reasoning_chain = parsed.get("reasoning_chain") or []
+        if isinstance(reasoning_chain, list):
+            base.reasoning_chain = [str(r) for r in reasoning_chain]
+
+        # Stash any new concepts/relationships the VLM proposed, so the
+        # DynamicOntologyExpander can pick them up via the same hooks the
+        # OpenAI analyzer uses.
+        self._pending_new_concepts = list(parsed.get("new_concepts", []) or [])
+        self._pending_new_relationships = list(
+            parsed.get("new_relationships", []) or []
+        )
+
+        return base
+
+    def analyze_query(
+        self,
+        query: str,
+        ontology: Any,
+        image_input: Any = None,
+        latex_text: str = "",
+    ) -> "QueryAnalysisResult":
+        if not self.is_available():
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        # Construct multimodal prompt ------------------------------------
+        system_prompt = (
+            "You are an expert in dendrite growth in partitioned electrolytes "
+            "(phase-field modeling). Analyze the provided image (if any), "
+            "LaTeX/text context, and user query. Return ONLY valid JSON with: "
+            '"primary_problem" (geometry_impact, phase_properties, '
+            "electrochemical_kinetics, mechanical_suppression, general, "
+            "multi_problem), \"explicitly_mentioned\" (snake_case list), "
+            "\"inferred_concepts\" (list), \"query_type\", \"highlight_paths\" "
+            "(list of [src, tgt]), \"reasoning_chain\" (list of strings)."
+        )
+
+        user_content: List[Dict[str, Any]] = []
+        if image_input is not None:
+            user_content.append({"type": "image", "image": image_input})
+
+        text_prompt = f"User Query: {query}\n"
+        if latex_text.strip():
+            # Truncate to avoid OOM on very long LaTeX attachments.
+            text_prompt += (
+                f"Additional LaTeX/Text Context:\n{latex_text[:2000]}\n"
+            )
+        text_prompt += "\nReturn ONLY valid JSON."
+        user_content.append({"type": "text", "text": text_prompt})
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            # Apply chat template (tokenize=False keeps a single string).
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+            # Process inputs (handles both text-only and text+image).
+            if image_input is not None:
+                inputs = self.processor(
+                    text=[text],
+                    images=[image_input],
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self.model.device)
+            else:
+                inputs = self.processor(
+                    text=[text],
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self.model.device)
+
+            with torch.no_grad():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    temperature=0.1,
+                    do_sample=True,
+                )
+
+            # Decode only the newly generated tokens.
+            response = self.processor.decode(
+                output[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True,
+            )
+
+            # Extract the JSON object from the response.
+            json_match = re.search(r"\{.*\}", response, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                return self._build_result_from_parsed(parsed, query, ontology)
+
+        except Exception as e:
+            st.warning(f"VLM parsing failed: {e}")
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+    def unload_model(self) -> None:
+        if self.model is not None:
+            del self.model
+        if self.processor is not None:
+            del self.processor
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ============================================================================
+# v6.3 — MULTI-IMAGE VLM ANALYZER
+# ----------------------------------------------------------------------------
+# Replaces the single-image path in `VLMQueryAnalyzer`.  Accepts up to 6
+# figures with per-figure captions and 4000-char LaTeX context.  Falls back
+# to `FallbackAnalyzer` if the VLM cannot be loaded.
+# ============================================================================
+class MultiImageVLMQueryAnalyzer(VLMQueryAnalyzer):
+    """VLM analyzer supporting multiple images with per-figure captions.
+
+    Inherits model loading + 4-bit NF4 quantization + result-building from
+    :class:`VLMQueryAnalyzer`; only the prompt construction and the
+    `processor(...)` call differ (lists of images instead of a single image).
+    """
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        max_images: int = 6,
+    ):
+        super().__init__(model_name=model_name)
+        self.max_images = max_images
+
+    def analyze_query(
+        self,
+        query: str,
+        ontology: Any,
+        image_inputs: Any = None,
+        image_captions: Any = None,
+        latex_text: str = "",
+    ) -> "QueryAnalysisResult":
+        if not self.is_available():
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        # Normalize image_inputs to a list (cap at max_images) --------------
+        if image_inputs is None:
+            image_inputs = []
+        if isinstance(image_inputs, Image.Image):
+            image_inputs = [image_inputs]
+        image_inputs = list(image_inputs)[: self.max_images]
+
+        if image_captions is None:
+            image_captions = [f"Figure {i+1}" for i in range(len(image_inputs))]
+        image_captions = list(image_captions)[: len(image_inputs)]
+        # Pad captions if the user gave fewer than images
+        while len(image_captions) < len(image_inputs):
+            image_captions.append(f"Figure {len(image_captions)+1}")
+
+        # Build the multimodal prompt --------------------------------------
+        system_prompt = (
+            "You are an expert in dendrite growth in partitioned electrolytes "
+            "(phase-field modeling of lithium-metal electrodes with solid "
+            "partitions). You are given up to 6 figures from a manuscript "
+            "showing 6 numerical models (A-F) with different solid-liquid "
+            "ratios and geometries, each with a caption. Also given is the "
+            "user's LaTeX/text context and query.\n\n"
+            "Return ONLY valid JSON with these keys:\n"
+            '  "primary_problem": one of geometry_impact, phase_properties, '
+            "electrochemical_kinetics, mechanical_suppression, general, "
+            "multi_problem\n"
+            '  "explicitly_mentioned": snake_case list of canonical concepts '
+            "from the query or figure captions\n"
+            '  "inferred_concepts": list of additional relevant concepts\n'
+            '  "query_type": causal | comparison | solution | definition | '
+            "general\n"
+            '  "highlight_paths": list of [source, target] concept pairs to '
+            "highlight\n"
+            '  "reasoning_chain": list of strings explaining analysis steps\n'
+            '  "model_descriptions": dict mapping "Model A".."Model F" to a '
+            "1-2 sentence description of what you see in the corresponding "
+            "figure (geometry, S/L ratio, dendrite length, stress field). "
+            "Only include models you can actually identify from the figures.\n"
+            '  "new_concepts": list of {name, type, definition, synonyms} for '
+            "physics terms not in the standard ontology\n"
+            '  "new_relationships": list of [source, rel_type, target, '
+            "confidence] for causal chains you observe"
+        )
+
+        user_content: List[Dict[str, Any]] = []
+        # Interleave images with their captions so the VLM can ground each
+        # caption to the corresponding visual region.
+        for img, cap in zip(image_inputs, image_captions):
+            user_content.append({"type": "image", "image": img})
+            user_content.append({"type": "text", "text": f"[{cap}]"})
+
+        text_prompt = f"User Query: {query}\n"
+        if latex_text.strip():
+            # v6.3: 4000-char budget (was 2000) to accommodate manuscript-level
+            # LaTeX context with multiple equations.
+            text_prompt += (
+                f"LaTeX/Text Context:\n{latex_text[:4000]}\n"
+            )
+        text_prompt += "\nReturn ONLY valid JSON."
+        user_content.append({"type": "text", "text": text_prompt})
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            if image_inputs:
+                inputs = self.processor(
+                    text=[text],
+                    images=image_inputs,           # ← LIST of images
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self.model.device)
+            else:
+                inputs = self.processor(
+                    text=[text],
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self.model.device)
+
+            with torch.no_grad():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=1024,           # ← larger budget for 6 models
+                    temperature=0.1,
+                    do_sample=True,
+                )
+
+            response = self.processor.decode(
+                output[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True,
+            )
+
+            json_match = re.search(r"\{.*\}", response, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                result = self._build_result_from_parsed(parsed, query, ontology)
+                # Attach model_descriptions for downstream dashboards.
+                model_desc = parsed.get("model_descriptions") or {}
+                if isinstance(model_desc, dict):
+                    # Stash on the result object via a dynamic attribute.
+                    setattr(result, "model_descriptions", model_desc)
+                else:
+                    setattr(result, "model_descriptions", {})
+                return result
+
+        except Exception as e:
+            st.warning(f"Multi-image VLM parsing failed: {e}")
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+
+# ============================================================================
+# v6.4 — OLLAMA BACKEND VLM ANALYZER (vision-language models)
+# ----------------------------------------------------------------------------
+# Multimodal analyzer backed by a local Ollama server.  Supports InternVL,
+# Qwen-VL, and any other multimodal model pulled via `ollama pull`.
+# Accepts up to 6 images with captions + LaTeX context.  Falls back to
+# `FallbackAnalyzer` if the server is down or the model is not pulled.
+# ============================================================================
+class OllamaVLMQueryAnalyzer(LLMQueryAnalyzer):
+    """Vision-Language analyzer backed by a local Ollama server.
+    Supports InternVL, Qwen-VL, and any other multimodal model pulled via
+    `ollama pull`.  Accepts up to 6 images with captions + LaTeX context.
+    """
+    def __init__(self, model_tag: str, max_images: int = 6, num_ctx: int = 16384):
+        self.model_tag = model_tag
+        self.max_images = max_images
+        # Ollama's default `num_ctx` is 4096, which is too small for
+        # multi-figure prompts (6 figures + captions + LaTeX routinely
+        # exceed 12k tokens).  16384 fits most 6-figure prompts; raise to
+        # 32768 if context-overflow warnings still appear (uses more
+        # VRAM).  Tunable live from the sidebar without editing code.
+        self.num_ctx = num_ctx
+        self._pending_new_concepts: List[Any] = []
+        self._pending_new_relationships: List[Any] = []
+
+    def is_available(self) -> bool:
+        if not OLLAMA_AVAILABLE:
+            return False
+        return _ollama_has_model(self.model_tag)
+
+    def analyze_query(
+        self,
+        query: str,
+        ontology: Any,
+        image_inputs: Any = None,
+        image_captions: Any = None,
+        latex_text: str = "",
+    ) -> "QueryAnalysisResult":
+        if not self.is_available():
+            st.warning(
+                f"⚠️ Ollama VLM `{self.model_tag}` not pulled locally. "
+                f"Run: `ollama pull {self.model_tag}`"
+            )
+            return FallbackAnalyzer().analyze_query(query, ontology)
+
+        # Normalize image inputs
+        if image_inputs is None:
+            image_inputs = []
+        if isinstance(image_inputs, Image.Image):
+            image_inputs = [image_inputs]
+        image_inputs = list(image_inputs)[: self.max_images]
+
+        if image_captions is None:
+            image_captions = [f"Figure {i+1}" for i in range(len(image_inputs))]
+        image_captions = list(image_captions)[: len(image_inputs)]
+        while len(image_captions) < len(image_inputs):
+            image_captions.append(f"Figure {len(image_captions)+1}")
+
+        # Build multimodal prompt
+        system_prompt = (
+            "You are an expert in dendrite growth in partitioned electrolytes. "
+            "Analyze the provided figures, captions, LaTeX context, and query. "
+            "Return ONLY valid JSON with: primary_problem, explicitly_mentioned "
+            "(snake_case), inferred_concepts, query_type, highlight_paths "
+            "(list of [src,tgt]), reasoning_chain, model_descriptions "
+            "(dict Model A..F -> 1-2 sentence description)."
+        )
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+
+            # ---- THE FIX: encode PIL → base64 strings ----
+            # Ollama's `chat()` `images` field only accepts base64 strings
+            # (or bytes / paths), never raw PIL objects.  The previous
+            # implementation passed PIL objects directly, which tripped
+            # pydantic validation in the ollama client and caused every
+            # multimodal query to silently fall back to rule-based.
+            image_b64 = [_pil_to_b64(img) for img in image_inputs]
+
+            # ---- num_ctx override + graceful image-shedding retry ----
+            # Qwen2.5-VL and similar VLMs tokenize each figure at a high
+            # variable rate (often 1k-2k+ tokens/image), so 6 figures can
+            # still overflow even a 16k context.  We request an enlarged
+            # `num_ctx` (default 16384, tunable via the constructor / the
+            # sidebar) and, if the server still reports a context-length
+            # error, retry with one fewer figure until it fits -- emitting
+            # a visible warning each time instead of silently falling back
+            # to rule-based analysis.  `keep_alive="10m"` keeps the model
+            # warm in Ollama between Streamlit reruns so successive queries
+            # don't pay the cold-load latency.
+            surviving_imgs: List[str] = list(image_b64)
+            surviving_caps: List[str] = list(image_captions)
+            content = ""
+            while True:
+                # Rebuild the user prompt each pass so the caption list
+                # always matches the surviving image set.
+                user_text = f"User Query: {query}\n"
+                for cap in surviving_caps:
+                    user_text += f"[{cap}]\n"
+                if latex_text.strip():
+                    user_text += f"LaTeX/Text Context:\n{latex_text[:4000]}\n"
+                user_text += "\nReturn ONLY valid JSON."
+
+                message: Dict[str, Any] = {"role": "user", "content": user_text}
+                if surviving_imgs:
+                    message["images"] = surviving_imgs  # list of base64 strings
+
+                try:
+                    response = client.chat(
+                        model=self.model_tag,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            message,
+                        ],
+                        options={
+                            "temperature": 0.1,
+                            "num_predict": 1500,
+                            "num_ctx": self.num_ctx,  # override Ollama's 4096 default
+                        },
+                        keep_alive="10m",
+                        format="json",
+                    )
+                    content = _ollama_content(response)
+                    break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_ctx_err = any(
+                        k in err_str
+                        for k in (
+                            "context window",
+                            "context length",
+                            "num_ctx",
+                            "too many tokens",
+                            "exceed",
+                            "maximum context",
+                        )
+                    )
+                    # Shed one figure and retry; stop when only one image
+                    # remains or the error is not a context-length issue.
+                    if is_ctx_err and len(surviving_imgs) > 1:
+                        dropped = surviving_caps.pop()
+                        surviving_imgs.pop()
+                        st.warning(
+                            f"⚠️ Context window ({self.num_ctx} tokens) "
+                            f"exceeded with {len(surviving_imgs) + 1} "
+                            f"figures; retrying without **{dropped}**. "
+                            f"To keep all figures, raise `num_ctx` (e.g. "
+                            f"32768) in the sidebar or upload fewer images."
+                        )
+                        continue
+                    raise
+
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                # Reuse VLM result builder
+                base = FallbackAnalyzer().analyze_query(query, ontology)
+                problem_map = {
+                    "geometry_impact": BatteryProblem.GEOMETRY_IMPACT,
+                    "phase_properties": BatteryProblem.PHASE_PROPERTIES,
+                    "electrochemical_kinetics": BatteryProblem.ELECTROCHEMICAL_KINETICS,
+                    "mechanical_suppression": BatteryProblem.MECHANICAL_SUPPRESSION,
+                    "general": BatteryProblem.GENERAL,
+                    "multi_problem": BatteryProblem.MULTI_PROBLEM,
+                }
+                raw_problem = (parsed.get("primary_problem") or "").strip().lower()
+                if raw_problem in problem_map:
+                    base.primary_problem = problem_map[raw_problem]
+                base.explicitly_mentioned = parsed.get("explicitly_mentioned", []) or []
+                base.inferred_concepts = parsed.get("inferred_concepts", []) or []
+                base.query_type = parsed.get("query_type", "general")
+                base.reasoning_chain = parsed.get("reasoning_chain", []) or []
+                self._pending_new_concepts = parsed.get("new_concepts", []) or []
+                self._pending_new_relationships = parsed.get("new_relationships", []) or []
+                model_desc = parsed.get("model_descriptions", {}) or {}
+                setattr(base, "model_descriptions", model_desc)
+                return base
+            st.warning("Ollama VLM response did not contain JSON; falling back.")
+        except Exception as e:
+            st.warning(f"Ollama VLM call failed: {e}")
+        return FallbackAnalyzer().analyze_query(query, ontology)
+
+    def unload_model(self) -> None:
+        try:
+            client = ollama.Client(host=OLLAMA_BASE_URL)
+            client.generate(model=self.model_tag, keep_alive=0)
+        except Exception:
+            pass
+
+
+# ============================================================================
+# v6.3 — MODEL ↔ ABSTRACT ASSOCIATION PIPELINE
+# ----------------------------------------------------------------------------
+# Computes a 6×N similarity matrix between the 6 numerical models (A-F) and
+# the N abstracts/records in the loaded JSON ground-truth using
+# SentenceTransformer embeddings.  Renders as a Plotly heatmap plus per-model
+# top-abstract listings.
+# ============================================================================
+@st.cache_data(show_spinner=False, ttl=3600)
+def associate_models_with_abstracts(
+    abstracts: List[str],
+    _embed_model_state_key: str = "default",
+) -> Tuple[List[str], np.ndarray, Dict[str, List[Dict]]]:
+    """For each of the 6 models, compute cosine similarity to every abstract.
+
+    Returns
+    -------
+    model_names : List[str]
+        The 6 model names in row order.
+    sim_matrix : np.ndarray, shape (6, N)
+        Cosine similarity matrix (rows = models, cols = abstracts).
+    top_per_model : Dict[str, List[Dict]]
+        Top-5 abstracts per model: ``{"abstract_idx": int, "score": float}``.
+    """
+    embed_model = load_embedding_model()
+    model_names = NUMERICAL_MODEL_NAMES
+    # Encode each model's physics-flattened text
+    model_texts = [model_physics_to_text(name) for name in model_names]
+    model_embs = embed_model.encode(
+        model_texts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        batch_size=8,
+    )
+    # Encode abstracts (empty strings → zero vectors so we don't crash)
+    safe_abstracts = [a if a and a.strip() else " " for a in abstracts]
+    abstract_embs = embed_model.encode(
+        safe_abstracts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        batch_size=32,
+    )
+    # Cosine similarity matrix: models × abstracts
+    sim_matrix = model_embs @ abstract_embs.T  # shape (6, N)
+    top_per_model: Dict[str, List[Dict]] = {}
+    for i, name in enumerate(model_names):
+        scores = sim_matrix[i]
+        top_indices = np.argsort(scores)[::-1][:5]
+        top_per_model[name] = [
+            {"abstract_idx": int(idx), "score": float(scores[idx])}
+            for idx in top_indices
+        ]
+    del model_embs, abstract_embs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return model_names, sim_matrix, top_per_model
+
+
+def render_model_abstract_association(
+    sim_matrix: np.ndarray,
+    model_names: List[str],
+    top_per_model: Dict[str, List[Dict]],
+    abstracts: List[str],
+    theme: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Render the 6×N model↔abstract similarity heatmap + per-model details."""
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+    st.subheader("Model ↔ Abstract Association")
+    st.caption(
+        "Cosine similarity between each model's flattened physics text and "
+        "each abstract's SentenceTransformer embedding. Brighter = more "
+        "relevant. Hover the heatmap for exact scores; expand a model below "
+        "to see its top-5 supporting abstracts."
+    )
+
+    n_abstracts = len(abstracts)
+    if n_abstracts == 0:
+        st.info("No abstracts loaded — build the concept graph first.")
+        return
+
+    # Cap the heatmap at 60 columns for readability; sample evenly if larger.
+    max_cols = 60
+    col_indices = list(range(n_abstracts))
+    if n_abstracts > max_cols:
+        col_indices = list(np.linspace(0, n_abstracts - 1, max_cols).astype(int))
+    display_matrix = sim_matrix[:, col_indices]
+    x_labels = [f"#{i}" for i in col_indices]
+
+    fig = px.imshow(
+        display_matrix,
+        x=x_labels,
+        y=model_names,
+        labels={"x": "Abstract", "y": "Model", "color": "Similarity"},
+        title="Model–Abstract Similarity Heatmap",
+        color_continuous_scale="Viridis",
+        aspect="auto",
+        text_auto=".2f",
+    )
+    fig.update_layout(
+        paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+        plot_bgcolor=theme.get("plotly_bg", "#ffffff"),
+        font_color=theme.get("font", "#000000"),
+        height=380,
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # Per-model detail
+    st.markdown("### Per-Model Top Supporting Abstracts")
+    for model_name in model_names:
+        top = top_per_model.get(model_name, [])
+        if not top:
+            continue
+        # Compose a short header showing the best score
+        best_score = top[0]["score"] if top else 0.0
+        with st.expander(
+            f"{model_name} — best similarity {best_score:.3f} "
+            f"(physics: {get_model_physics(model_name).get('geometry', '?')} "
+            f"S/L={get_model_physics(model_name).get('s_l_ratio', '?')}:1)"
+        ):
+            for entry in top:
+                idx = entry["abstract_idx"]
+                score = entry["score"]
+                snippet = abstracts[idx][:400] if idx < len(abstracts) else ""
+                st.markdown(
+                    f"**Abstract #{idx}** (similarity: `{score:.3f}`)"
+                )
+                st.caption(snippet + ("..." if len(snippet) == 400 else ""))
+                st.markdown("---")
+
+
+# ============================================================================
+# v6.3.4 — CSV EXPORT HELPERS
+# ----------------------------------------------------------------------------
+# Serialize the NUMERICAL_MODELS_PHYSICS dict and the physics-based similarity
+# matrix into clean DataFrames ready for CSV export.
+# ============================================================================
+def build_physics_csv_dataframe(all_physics: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Build a DataFrame from the physics dict suitable for physics.csv export.
+
+    Columns: Model, Geometry, S/L Ratio, Solid %, Max Length %, Area %,
+    Branches, Side Branch Suppression, VM Stress (MPa), E_solid (GPa),
+    Overpotential (mV), Time to Max (s).
+    """
+    def _supp(bc, supp, sf):
+        if supp and bc <= 2 and sf >= 0.60: return "High"
+        elif not supp and bc >= 5: return "Low"
+        else: return "Medium"
+    def _sl_str(r):
+        for k, l in [(4.0,"4:1"),(0.667,"2:3"),(1.5,"3:2"),(0.25,"1:4")]:
+            if abs(r - k) < 0.01: return l
+        return f"{r:.3f}:1" if r > 0 else "?:1"
+    rows = []
+    for name in NUMERICAL_MODEL_NAMES:
+        p = all_physics.get(name, {})
+        bc = int(p.get("branch_count", 0))
+        sf = float(p.get("solid_fraction", 0))
+        vm_gpa = float(p.get("von_mises_stress_peak_gpa", 0))
+        rows.append({
+            "Model": name,
+            "Geometry": p.get("geometry", "").replace("_", " ").title(),
+            "S/L Ratio": float(p.get("s_l_ratio", 0)),  # numeric for chart normalization
+            "Solid %": round(sf * 100, 1),
+            "Max Length %": round(float(p.get("max_dendrite_length_pct", 0)) * 100, 1),
+            "Area %": round(float(p.get("dendrite_area_pct", 0)) * 100, 2),
+            "Branches": bc,
+            "Side Branch Suppression": _supp(bc, p.get("side_branch_suppressed", False), sf),
+            "VM Stress (MPa)": round(vm_gpa * 1000, 1),
+            "E_solid (GPa)": float(p.get("youngs_modulus_solid_gpa", 0)),
+            "Overpotential (mV)": float(p.get("overpotential_mv", 0)),
+            "Time to Max (s)": int(p.get("time_to_max_length_s", 0)),
+        })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# v6.3.4 — PUBLICATION-QUALITY CUSTOMIZATION ENGINE
+# ----------------------------------------------------------------------------
+# Centralized style configuration that applies to ALL figures in the physics
+# tab. A single slider adjustment updates every chart to match the target
+# journal's requirements (Nature, Elsevier, ACS, etc.).
+# ============================================================================
+def render_publication_style_panel() -> Dict[str, Any]:
+    """Render the publication-quality customization panel and return a style
+    config dict consumed by all visualization functions."""
+    with st.expander("🎨 Publication Quality Customization", expanded=False):
+        st.markdown("#### Typography & Layout")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            font_family = st.selectbox(
+                "Font Family",
+                ["Arial", "Helvetica", "Times New Roman", "Courier New",
+                 "Inter", "Segoe UI"],
+                index=0, key="pub_font_family",
+            )
+        with col2:
+            font_size = st.slider("Base Font Size", 8, 24, 12, key="pub_font_size")
+        with col3:
+            title_size = st.slider("Title Font Size", 12, 32, 18, key="pub_title_size")
+
+        st.markdown("#### Dimensions & Export")
+        col4, col5, col6 = st.columns(3)
+        with col4:
+            width = st.slider("Figure Width (px)", 400, 1400, 800, key="pub_width")
+        with col5:
+            height = st.slider("Figure Height (px)", 300, 900, 500, key="pub_height")
+        with col6:
+            dpi = st.slider("Export DPI", 150, 600, 300, key="pub_dpi")
+
+        st.markdown("#### Axes & Ticks")
+        col7, col8 = st.columns(2)
+        with col7:
+            show_grid = st.checkbox("Show Gridlines", value=False, key="pub_show_grid")
+            grid_color = st.color_picker("Grid Color", "#E2E8F0", key="pub_grid_color")
+        with col8:
+            tick_len = st.slider("Tick Length", 0, 10, 5, key="pub_tick_len")
+
+        st.markdown("#### Colors & Lines")
+        line_width = st.slider("Line Width", 1, 5, 2, key="pub_line_width")
+        marker_size = st.slider("Marker Size", 4, 15, 8, key="pub_marker_size")
+
+    return {
+        "font_family": font_family,
+        "font_size": font_size,
+        "title_size": title_size,
+        "width": width,
+        "height": height,
+        "dpi": dpi,
+        "show_grid": show_grid,
+        "grid_color": grid_color,
+        "tick_len": tick_len,
+        "line_width": line_width,
+        "marker_size": marker_size,
+    }
+
+
+def apply_publication_style(fig: go.Figure, cfg: Dict[str, Any],
+                            title: str = "") -> go.Figure:
+    """Apply publication-quality styling to any Plotly figure.
+
+    Sets global layout (title, font, margins), axes styling (grid, ticks,
+    bold axis lines, mirror), and trace styling (line width, marker size).
+    """
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(family=cfg["font_family"], size=cfg["title_size"],
+                      color="black"),
+            x=0.5, xanchor="center",
+        ),
+        font=dict(family=cfg["font_family"], size=cfg["font_size"], color="black"),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        width=cfg["width"],
+        height=cfg["height"],
+        margin=dict(l=60, r=30, t=60, b=50),
+        showlegend=True,
+        legend=dict(
+            font=dict(size=max(8, cfg["font_size"] - 1)),
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="black",
+            borderwidth=1,
+        ),
+    )
+    # Axes styling (only affects cartesian plots; polar/sunburst/sankey ignore)
+    try:
+        fig.update_xaxes(
+            showgrid=cfg["show_grid"], gridcolor=cfg["grid_color"], gridwidth=1,
+            zeroline=False,
+            tickfont=dict(family=cfg["font_family"], size=cfg["font_size"]),
+            titlefont=dict(family=cfg["font_family"], size=cfg["font_size"] + 2),
+            ticklen=cfg["tick_len"],
+            linecolor="black", linewidth=1.5,
+            mirror=True,
+        )
+        fig.update_yaxes(
+            showgrid=cfg["show_grid"], gridcolor=cfg["grid_color"], gridwidth=1,
+            zeroline=False,
+            tickfont=dict(family=cfg["font_family"], size=cfg["font_size"]),
+            titlefont=dict(family=cfg["font_family"], size=cfg["font_size"] + 2),
+            ticklen=cfg["tick_len"],
+            linecolor="black", linewidth=1.5,
+            mirror=True,
+        )
+    except Exception:
+        pass  # Polar/sunburst/sankey figures don't have cartesian axes
+    # Trace styling
+    try:
+        fig.update_traces(
+            line=dict(width=cfg["line_width"]),
+            marker=dict(size=cfg["marker_size"],
+                        line=dict(width=1, color="white")),
+        )
+    except Exception:
+        pass
+    return fig
+
+
+def render_export_buttons(fig: go.Figure, filename_base: str,
+                          cfg: Dict[str, Any]) -> None:
+    """Render SVG (vector) and high-DPI PNG download buttons for a figure."""
+    col1, col2 = st.columns(2)
+    with col1:
+        try:
+            svg_bytes = fig.to_image(format="svg", engine="kaleido")
+            st.download_button(
+                label="⬇️ Download SVG (Vector)",
+                data=svg_bytes,
+                file_name=f"{filename_base}.svg",
+                mime="image/svg+xml",
+                key=f"dl_svg_{filename_base}",
+            )
+        except Exception as e:
+            st.caption(f"SVG export needs `kaleido`: `pip install kaleido` ({e})")
+    with col2:
+        try:
+            png_bytes = fig.to_image(
+                format="png",
+                width=cfg["width"] * 2,
+                height=cfg["height"] * 2,
+                scale=cfg["dpi"] / 100,
+                engine="kaleido",
+            )
+            st.download_button(
+                label=f"⬇️ Download PNG ({cfg['dpi']} DPI)",
+                data=png_bytes,
+                file_name=f"{filename_base}_{cfg['dpi']}dpi.png",
+                mime="image/png",
+                key=f"dl_png_{filename_base}",
+            )
+        except Exception as e:
+            st.caption(f"PNG export needs `kaleido`: `pip install kaleido` ({e})")
+
+
+# ============================================================================
+# v6.3.4 — FIVE PUBLICATION-QUALITY VISUALIZATIONS
+# ============================================================================
+def render_pub_radar_chart(df_physics: pd.DataFrame,
+                           cfg: Dict[str, Any]) -> go.Figure:
+    """Radar chart comparing the normalized physics profile of each model."""
+    metrics = ["S/L Ratio", "Solid %", "Max Length %", "Area %",
+               "Branches", "VM Stress (MPa)", "Time to Max (s)"]
+    df_norm = df_physics.copy()
+    for m in metrics:
+        vmin, vmax = float(df_physics[m].min()), float(df_physics[m].max())
+        df_norm[m] = (df_physics[m].astype(float) - vmin) / (vmax - vmin) if vmax > vmin else 0.0
+    fig = go.Figure()
+    for _, row in df_norm.iterrows():
+        r_vals = [float(row[m]) for m in metrics] + [float(row[metrics[0]])]
+        fig.add_trace(go.Scatterpolar(
+            r=r_vals,
+            theta=metrics + [metrics[0]],
+            fill="toself",
+            name=str(row["Model"]),
+            opacity=0.6,
+            line=dict(width=cfg["line_width"]),
+        ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 1.1],
+                            tickfont=dict(size=max(8, cfg["font_size"] - 1))),
+            angularaxis=dict(
+                tickfont=dict(family=cfg["font_family"], size=cfg["font_size"]),
+            ),
+        ),
+        showlegend=True,
+    )
+    return fig
+
+
+def render_pub_grouped_bar(df_physics: pd.DataFrame,
+                           cfg: Dict[str, Any]) -> go.Figure:
+    """Grouped bar chart comparing absolute physics metrics across models."""
+    metrics_to_plot = ["Max Length %", "Area %", "VM Stress (MPa)", "Branches"]
+    fig = go.Figure()
+    for metric in metrics_to_plot:
+        fig.add_trace(go.Bar(
+            x=df_physics["Model"],
+            y=df_physics[metric].astype(float),
+            name=metric,
+            text=df_physics[metric].astype(float).round(1),
+            textposition="auto",
+        ))
+    fig.update_layout(
+        barmode="group",
+        yaxis_title="Value",
+    )
+    return fig
+
+
+def render_pub_similarity_network(df_sim: pd.DataFrame,
+                                 cfg: Dict[str, Any]) -> go.Figure:
+    """Relational network diagram showing each model's top similarity match.
+
+    Uses a circular layout with networkx for proper 2D positioning. Edges are
+    drawn between each model and its most similar counterpart, with edge width
+    proportional to the similarity score.
+    """
+    # Get top match per model
+    top_sim = (
+        df_sim.sort_values("Physics Similarity", ascending=False)
+        .groupby("Model")
+        .first()
+        .reset_index()
+    )
+    models = sorted(df_sim["Model"].unique().tolist())
+    n = len(models)
+    # Circular layout
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    pos = {m: (np.cos(a), np.sin(a)) for m, a in zip(models, angles)}
+    fig = go.Figure()
+    # Draw edges
+    for _, row in top_sim.iterrows():
+        src, tgt = row["Model"], row["Similar To"]
+        sim = float(row["Physics Similarity"])
+        x0, y0 = pos[src]
+        x1, y1 = pos.get(tgt, (0, 0))
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[y0, y1],
+            mode="lines",
+            line=dict(color="rgba(100,100,100,0.5)",
+                      width=1 + sim * 4),
+            hoverinfo="text",
+            text=f"{src} → {tgt}<br>Similarity: {sim:.3f}",
+            showlegend=False,
+        ))
+    # Draw nodes
+    fig.add_trace(go.Scatter(
+        x=[pos[m][0] for m in models],
+        y=[pos[m][1] for m in models],
+        mode="markers+text",
+        marker=dict(size=cfg["marker_size"] * 2,
+                    color="rgba(59,130,246,0.7)",
+                    line=dict(width=2, color="white")),
+        text=models,
+        textposition="middle center",
+        textfont=dict(family=cfg["font_family"], size=cfg["font_size"], color="white"),
+        showlegend=False,
+    ))
+    fig.update_layout(
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                   range=[-1.5, 1.5]),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                   range=[-1.5, 1.5], scaleanchor="x", scaleratio=1),
+    )
+    return fig
+
+
+def render_pub_sunburst(df_physics: pd.DataFrame,
+                        cfg: Dict[str, Any]) -> go.Figure:
+    """Sunburst hierarchy: Root → Geometry → Model, sized by VM Stress."""
+    geometries = df_physics["Geometry"].tolist()
+    models = df_physics["Model"].tolist()
+    vm_stress = df_physics["VM Stress (MPa)"].astype(float).tolist()
+    max_len = df_physics["Max Length %"].astype(float).tolist()
+    # Build labels and parents
+    labels = ["Root"] + list(dict.fromkeys(geometries)) + models
+    parents = [""] + ["Root"] * len(dict.fromkeys(geometries)) + geometries
+    values = [0.0] + [0.0] * len(dict.fromkeys(geometries)) + vm_stress
+    fig = go.Figure(go.Sunburst(
+        labels=labels,
+        parents=parents,
+        values=values,
+        branchvalues="total",
+        textfont=dict(family=cfg["font_family"], size=cfg["font_size"]),
+    ))
+    fig.update_layout(
+        font=dict(family=cfg["font_family"], size=cfg["font_size"]),
+        width=cfg["width"], height=cfg["height"],
+    )
+    return fig
+
+
+def render_pub_sankey(df_physics: pd.DataFrame,
+                      cfg: Dict[str, Any]) -> go.Figure:
+    """Sankey diagram: Model → Side Branch Suppression Level."""
+    models = df_physics["Model"].tolist()
+    supp_levels = df_physics["Side Branch Suppression"].tolist()
+    vm_stress = df_physics["VM Stress (MPa)"].astype(float).tolist()
+    # Unique labels: models + suppression levels
+    supp_unique = sorted(set(supp_levels))
+    labels = models + supp_unique
+    # Build links: each model → its suppression level
+    source, target, value = [], [], []
+    for i, (m, s) in enumerate(zip(models, supp_levels)):
+        source.append(i)  # model index
+        target.append(len(models) + supp_unique.index(s))  # supp index
+        value.append(vm_stress[i])  # weight by VM stress
+    fig = go.Figure(go.Sankey(
+        node=dict(
+            label=labels,
+            pad=15,
+            thickness=20,
+            line=dict(color="black", width=0.5),
+        ),
+        link=dict(
+            source=source,
+            target=target,
+            value=value,
+        ),
+    ))
+    fig.update_layout(
+        font=dict(family=cfg["font_family"], size=cfg["font_size"]),
+        width=cfg["width"], height=cfg["height"],
+    )
+    return fig
+
+
+# ============================================================================
+# v6.3 — NUMERICAL MODELS PHYSICS TAB RENDERER
+# ============================================================================
+def render_numerical_models_physics_tab(theme: Optional[Dict[str, Any]] = None) -> None:
+    """Render the 6 models' physics as an editable table + radar chart.
+
+    v6.3.3 FIX:
+      * VM stress field name corrected from `von_mises_stress_peak_mpa` (which
+        doesn't exist in the dict) to `von_mises_stress_peak_gpa` with proper
+        GPa→MPa conversion (×1000).
+      * Side branch suppression now reported as High/Medium/Low level based on
+        branch_count + side_branch_suppressed flag, instead of Yes/No.
+      * S/L Ratio column shows the actual ratio (e.g. "4:1", "2:3") rather
+        than the float value with ":1" appended.
+      * Radar chart field name also fixed to use GPa field.
+      * Caption corrected (was "A–C use S/L=4:1; D–F use S/L=1:1" — wrong).
+    """
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+
+    st.header("Numerical Models Physics (A–F)")
+    st.caption(
+        "Canonical physics for the 6 manuscript models, layered on top of the "
+        "JSON ground-truth. Hardcoded values come from `NUMERICAL_MODELS_PHYSICS`; "
+        "the sidebar uploader (`model_physics_overrides.json`) overrides them "
+        "at runtime. S/L ratios: A=4:1, B=2:3, C=4:1, D=3:2, E=1:4, F=2:3."
+    )
+
+    all_physics = get_all_model_physics()
+
+    # --- Helper: side branch suppression level ---
+    def _suppression_level(branch_count: int, suppressed: bool, solid_fraction: float = 0.5) -> str:
+        # High suppression requires: suppressed flag + few branches + sufficient solid fraction
+        # (Models A, C: 80% solid, few branches → strong confinement)
+        if suppressed and branch_count <= 2 and solid_fraction >= 0.60:
+            return "High"
+        elif not suppressed and branch_count >= 5:
+            return "Low"
+        else:
+            return "Medium"
+
+    # --- Helper: S/L ratio display string ---
+    def _sl_ratio_str(ratio: float) -> str:
+        """Convert a float s_l_ratio back to a readable 'S:L' string."""
+        # Handle the known ratios exactly
+        ratio_map = {4.0: "4:1", 0.667: "2:3", 1.5: "3:2", 0.25: "1:4"}
+        for key, label in ratio_map.items():
+            if abs(ratio - key) < 0.01:
+                return label
+        # Fallback: show as fraction
+        if ratio > 0:
+            return f"{ratio:.3f}:1"
+        return "?:1"
+
+    # --- Compact table ---
+    table_rows = []
+    for name in NUMERICAL_MODEL_NAMES:
+        p = all_physics[name]
+        # FIX: Convert GPa to MPa (multiply by 1000)
+        vm_stress_gpa = float(p.get("von_mises_stress_peak_gpa", 0.0))
+        vm_stress_mpa = vm_stress_gpa * 1000  # 0.059 GPa → 59 MPa
+        # FIX: Side branch suppression as probability level
+        branch_count = int(p.get("branch_count", 0))
+        suppression_level = _suppression_level(
+            branch_count, p.get("side_branch_suppressed", False),
+            float(p.get("solid_fraction", 0.5))
+        )
+        table_rows.append({
+            "Model": name,
+            "Geometry": p.get("geometry", "").replace("_", " ").title(),
+            "S/L Ratio": _sl_ratio_str(float(p.get("s_l_ratio", 0))),
+            "Solid %": f"{p.get('solid_fraction', 0)*100:.0f}%",
+            "Max Length %": f"{p.get('max_dendrite_length_pct', 0)*100:.0f}%",
+            "Area %": f"{p.get('dendrite_area_pct', 0)*100:.0f}%",
+            "Branches": branch_count,
+            "Side Branch Suppression": suppression_level,
+            "VM Stress (MPa)": f"{vm_stress_mpa:.1f}",
+            "E_solid (GPa)": f"{p.get('youngs_modulus_solid_gpa', 0):.0f}",
+            "Overpotential (mV)": f"{p.get('overpotential_mv', 0):.0f}",
+        })
+    table_df = pd.DataFrame(table_rows)
+    st.dataframe(table_df, width="stretch", hide_index=True)
+
+    # --- Full physics as expandable per-model cards ---
+    st.markdown("### Detailed Physics per Model")
+    for name in NUMERICAL_MODEL_NAMES:
+        p = all_physics[name]
+        with st.expander(f"{name} — {p.get('description', '')}", expanded=False):
+            detail_rows = [{"Field": k, "Value": str(v)} for k, v in p.items() if k != "description"]
+            st.dataframe(pd.DataFrame(detail_rows), width="stretch", hide_index=True)
+
+    # --- Radar chart comparing the 6 models on normalized key metrics ---
+    st.markdown("### Normalized Model Comparison (Radar)")
+    # v6.3.3 FIX: field name corrected to von_mises_stress_peak_gpa
+    # (was von_mises_stress_peak_mpa which doesn't exist → all zeros)
+    radar_metrics = [
+        ("max_dendrite_length_pct", "Dendrite Length"),
+        ("dendrite_area_pct", "Dendrite Area"),
+        ("von_mises_stress_peak_gpa", "VM Stress"),
+        ("branch_count", "Branch Count"),
+        ("s_l_ratio", "S/L Ratio"),
+        ("time_to_max_length_s", "Time to Max"),
+    ]
+    # Normalize each metric to [0, 1] across the 6 models
+    raw_values = {label: [] for _, label in radar_metrics}
+    for name in NUMERICAL_MODEL_NAMES:
+        p = all_physics[name]
+        for field, label in radar_metrics:
+            raw_values[label].append(float(p.get(field, 0.0)))
+    norm_values = {}
+    for label, vals in raw_values.items():
+        vmax = max(vals) if vals and max(vals) > 0 else 1.0
+        vmin = min(vals) if vals else 0.0
+        rng = max(vmax - vmin, 1e-9)
+        norm_values[label] = [(v - vmin) / rng for v in vals]
+
+    fig = go.Figure()
+    for i, name in enumerate(NUMERICAL_MODEL_NAMES):
+        r_vals = [norm_values[label][i] for _, label in radar_metrics]
+        r_vals_closed = r_vals + [r_vals[0]]
+        theta = [label for _, label in radar_metrics] + [radar_metrics[0][1]]
+        fig.add_trace(go.Scatterpolar(
+            r=r_vals_closed,
+            theta=theta,
+            fill="toself",
+            name=name,
+            opacity=0.6,
+            line=dict(width=2),
+        ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 1.05]),
+            angularaxis=dict(tickfont=dict(size=11)),
+        ),
+        showlegend=True,
+        title="6-Model Normalized Physics Comparison",
+        paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+        font_color=theme.get("font", "#000000"),
+        height=500,
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # --- Physics-based model association (v6.3.5: hybrid block-wise) ---
+    st.markdown("### Physics-Based Model Association (Hybrid)")
+    alpha = st.session_state.get("qdwa_sim_alpha", 0.4)
+    st.caption(
+        f"Block-wise hybrid similarity: **(1−α)·S_numeric + α·S_categorical** "
+        f"with α={alpha:.2f}. The numeric block uses Min-Max-normalized cosine "
+        f"on 6 quantitative features (S/L, solid %, length, area, VM stress, "
+        f"time). The categorical block uses one-hot geometry ⊕ ordinal "
+        f"side-branch level. Adjust α in the QDWA customization panel above."
+    )
+    assoc_df = compute_physics_based_model_association(all_physics)
+    st.dataframe(assoc_df, width="stretch", hide_index=True)
+
+    # --- v6.3.5: Three-panel similarity heatmap (numeric / categorical / combined) ---
+    st.markdown("#### Three-Panel Similarity Heatmap")
+    st.caption(
+        "Left: numeric physics similarity (S/L, solid %, length, area, VM stress, "
+        "time). Center: structural (categorical) similarity — 1.0 if same "
+        "geometry + suppression level, 0.0 otherwise. Right: combined score. "
+        "The block structure in the center panel reveals that Models A↔D, "
+        "B↔E, C↔F share the same geometry type."
+    )
+    blocks = physics_similarity_hybrid(all_physics, alpha)
+    heat_cols = st.columns(3)
+    heat_specs = [
+        (heat_cols[0], "numeric", "Numeric physics similarity"),
+        (heat_cols[1], "categorical", "Structural (categorical) similarity"),
+        (heat_cols[2], "combined", f"Combined (α={alpha:.2f})"),
+    ]
+    for col, key, title in heat_specs:
+        with col:
+            fig_h = px.imshow(
+                blocks[key].values,
+                x=blocks[key].columns.tolist(),
+                y=blocks[key].index.tolist(),
+                zmin=0.0, zmax=1.0,
+                color_continuous_scale="Viridis",
+                text_auto=".2f",
+                title=title,
+            )
+            fig_h.update_layout(
+                height=320,
+                margin=dict(l=10, r=10, t=40, b=10),
+                font=dict(size=10),
+            )
+            st.plotly_chart(fig_h, width="stretch")
+
+    # --- v6.3.5: Diverging difference heatmap (combined − numeric) ---
+    st.markdown("#### Diverging Difference: Combined − Numeric")
+    st.caption(
+        "Red cells: categorical features **increase** similarity (structurally-"
+        "alike pairs that the numeric block missed). Blue cells: categorical "
+        "features **decrease** similarity (structurally-different pairs that "
+        "happen to be numerically close). This is the scientifically "
+        "informative plot — it's where 'same physics, different geometry' "
+        "and 'same geometry, different physics' become visible."
+    )
+    diff_matrix = (blocks["combined"] - blocks["numeric"]).values
+    fig_diff = px.imshow(
+        diff_matrix,
+        x=blocks["combined"].columns.tolist(),
+        y=blocks["combined"].index.tolist(),
+        zmin=-0.5, zmax=0.5,
+        color_continuous_scale="RdBu_r",
+        text_auto=".2f",
+        title=f"Δ = S_combined − S_numeric (α={alpha:.2f})",
+    )
+    fig_diff.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(size=11),
+    )
+    st.plotly_chart(fig_diff, width="stretch")
+
+    # --- v6.3.4: CSV exports (physics.csv + similarity.csv) ---
+    st.markdown("### Export Data as CSV")
+    physics_csv_df = build_physics_csv_dataframe(all_physics)
+    similarity_csv_df = assoc_df.copy()
+    csv_col1, csv_col2, csv_col3 = st.columns(3)
+    with csv_col1:
+        st.download_button(
+            "⬇️ Download physics.csv",
+            data=physics_csv_df.to_csv(index=False).encode("utf-8"),
+            file_name="physics.csv",
+            mime="text/csv",
+        )
+    with csv_col2:
+        st.download_button(
+            "⬇️ Download similarity.csv",
+            data=similarity_csv_df.to_csv(index=False).encode("utf-8"),
+            file_name="similarity.csv",
+            mime="text/csv",
+        )
+    with csv_col3:
+        physics_json = json.dumps(all_physics, indent=2, default=str)
+        st.download_button(
+            "⬇️ Download physics.json",
+            data=physics_json.encode("utf-8"),
+            file_name="numerical_models_physics_current.json",
+            mime="application/json",
+        )
+
+    # --- v6.3.4: Publication-Quality Visualization Suite ---
+    st.markdown("### Publication-Quality Visualization Suite")
+    st.caption(
+        "All charts below share a centralized style configuration. Adjust the "
+        "panel above to match your target journal (Nature, Elsevier, ACS, etc.) "
+        "and every chart updates instantly. SVG (vector) and high-DPI PNG "
+        "exports are available for each figure."
+    )
+    pub_cfg = render_publication_style_panel()
+    viz_choice = st.selectbox(
+        "Select visualization:",
+        ["Radar Chart (Normalized Profile)",
+         "Grouped Bar Chart (Absolute Values)",
+         "Similarity Network (Top Match)",
+         "Sunburst Hierarchy (Geometry → Model)",
+         "Sankey Diagram (Model → Suppression)"],
+        key="pub_viz_select",
+    )
+    if viz_choice.startswith("Radar"):
+        fig = render_pub_radar_chart(physics_csv_df, pub_cfg)
+        fig = apply_publication_style(fig, pub_cfg, "Normalized Physics Profile (Radar)")
+        st.plotly_chart(fig, width="stretch")
+        render_export_buttons(fig, "radar_chart", pub_cfg)
+    elif viz_choice.startswith("Grouped Bar"):
+        fig = render_pub_grouped_bar(physics_csv_df, pub_cfg)
+        fig = apply_publication_style(fig, pub_cfg, "Absolute Physics Metrics Comparison")
+        st.plotly_chart(fig, width="stretch")
+        render_export_buttons(fig, "grouped_bar", pub_cfg)
+    elif viz_choice.startswith("Similarity Network"):
+        fig = render_pub_similarity_network(similarity_csv_df, pub_cfg)
+        fig = apply_publication_style(fig, pub_cfg, "Model Similarity Network (Top Match)")
+        st.plotly_chart(fig, width="stretch")
+        render_export_buttons(fig, "similarity_network", pub_cfg)
+    elif viz_choice.startswith("Sunburst"):
+        fig = render_pub_sunburst(physics_csv_df, pub_cfg)
+        st.plotly_chart(fig, width="stretch")
+        render_export_buttons(fig, "sunburst", pub_cfg)
+    elif viz_choice.startswith("Sankey"):
+        fig = render_pub_sankey(physics_csv_df, pub_cfg)
+        st.plotly_chart(fig, width="stretch")
+        render_export_buttons(fig, "sankey", pub_cfg)
+
+
+# ============================================================================
+# v6.3.3 — PHYSICS-BASED MODEL ASSOCIATION
+# ----------------------------------------------------------------------------
+# Computes similarity between models based on their numerical physics
+# parameters (S/L ratio, solid fraction, dendrite length, area, branch count,
+# VM stress, time to max length) rather than abstract text embeddings.
+# ============================================================================
+# ============================================================================
+# v6.3.5 — HYBRID PHYSICS SIMILARITY (block-wise numeric + categorical)
+# ----------------------------------------------------------------------------
+# Strategy A from the design brief: compute numeric cosine and categorical
+# cosine as SEPARATE blocks, then combine via a convex blend:
+#   S_combined = (1-α)·S_numeric + α·S_categorical
+# This avoids the scale-coupling problem of naive one-hot concatenation
+# (where 7 numeric dims dominate 4 categorical dims) and gives three
+# interpretable matrices for free.
+# ============================================================================
+
+# Numeric features used for the numeric similarity block.
+# Zero-variance columns (E_solid=155, overpotential=450) are dropped
+# automatically by `keep = Xnum_raw.std(axis=0) > 0`.
+_HYBRID_NUMERIC_FEATURES: List[str] = [
+    "s_l_ratio",
+    "solid_fraction",
+    "max_dendrite_length_pct",
+    "dendrite_area_pct",
+    "von_mises_stress_peak_gpa",
+    "time_to_max_length_s",
+]
+# NOTE: branch_count is NOT in the numeric block — it's captured via the
+# ordinal side_branch_level in the categorical block to avoid double-counting.
+
+# 3-level ordinal collapse of side_branch_suppressed + branch_count
+_SB_ORDINAL = {"High": 1.0, "Medium": 0.5, "Low": 0.0, True: 1.0, False: 0.0}
+
+
+def _derive_side_branch_level(physics: Dict[str, Any]) -> str:
+    """Derive a 3-level ordinal suppression label from branch_count + flag."""
+    suppressed = bool(physics.get("side_branch_suppressed", False))
+    branches = int(physics.get("branch_count", 0))
+    solid_fraction = float(physics.get("solid_fraction", 0.5))
+    # High: suppressed + few branches + sufficient solid fraction (Models A, C)
+    if suppressed and branches <= 2 and solid_fraction >= 0.60:
+        return "High"
+    # Low: not suppressed + many branches (Models D, E)
+    if not suppressed and branches >= 5:
+        return "Low"
+    return "Medium"
+
+
+def _minmax_normalize_cols(X: np.ndarray) -> np.ndarray:
+    """Column-wise Min-Max to [0, 1]; zero-variance columns → 0 (safe)."""
+    if X.size == 0:
+        return X
+    lo = X.min(axis=0)
+    hi = X.max(axis=0)
+    rng = hi - lo
+    rng[rng == 0] = 1.0
+    return (X - lo) / rng
+
+
+def _cosine_matrix(X: np.ndarray) -> np.ndarray:
+    """Row-wise cosine similarity for a non-negative feature matrix."""
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    Xu = X / norms
+    return np.clip(Xu @ Xu.T, 0.0, 1.0)
+
+
+def physics_similarity_hybrid(
+    model_physics: Dict[str, Dict[str, Any]],
+    categorical_weight: float = 0.4,
+) -> Dict[str, pd.DataFrame]:
+    """Block-wise hybrid similarity: numeric cosine ⊕ categorical cosine.
+
+    Returns a dict with three DataFrames (all indexed by model name):
+      - 'numeric':     cosine on Min-Max-normalized numeric features
+      - 'categorical': cosine on one-hot geometry ⊕ ordinal side-branch level
+      - 'combined':    (1-α)·numeric + α·categorical
+
+    Parameters
+    ----------
+    categorical_weight : float
+        α ∈ [0, 1]. α=0 → numeric only (old behavior); α=0.4 → default
+        (geometry as modifier of physics); α=1 → structural only.
+    """
+    names = list(model_physics.keys())
+    if len(names) < 2:
+        empty = pd.DataFrame(index=names, columns=names, dtype=float)
+        return {"numeric": empty, "categorical": empty, "combined": empty}
+
+    # --- Numeric block (drop zero-variance columns automatically) ---
+    Xnum_raw = np.array(
+        [[float(model_physics[m].get(f, 0.0)) for f in _HYBRID_NUMERIC_FEATURES]
+         for m in names],
+        dtype=float,
+    )
+    keep = Xnum_raw.std(axis=0) > 0
+    Xnum = _minmax_normalize_cols(Xnum_raw[:, keep])
+    Snum = _cosine_matrix(Xnum)
+
+    # --- Categorical block ---
+    # One-hot encode geometry (3 unique values: boundary_layer, alternating_layers, central_layer)
+    geoms = sorted({model_physics[m]["geometry"] for m in names})
+    geom_onehot = np.array(
+        [[1.0 if model_physics[m]["geometry"] == g else 0.0 for g in geoms]
+         for m in names],
+        dtype=float,
+    )
+    # Ordinal side-branch level (High=1.0, Medium=0.5, Low=0.0)
+    sb = np.array(
+        [[_SB_ORDINAL[_derive_side_branch_level(model_physics[m])]]
+         for m in names],
+        dtype=float,
+    )
+    Xcat = np.hstack([geom_onehot, sb])
+    Scat = _cosine_matrix(Xcat)
+
+    # --- Combine via convex blend ---
+    a = float(np.clip(categorical_weight, 0.0, 1.0))
+    Scomb = (1.0 - a) * Snum + a * Scat
+
+    def _df(M: np.ndarray) -> pd.DataFrame:
+        return pd.DataFrame(np.round(M, 4), index=names, columns=names)
+
+    return {"numeric": _df(Snum), "categorical": _df(Scat), "combined": _df(Scomb)}
+
+
+def physics_similarity_gower(
+    model_physics: Dict[str, Dict[str, Any]],
+    numeric_weight: float = 0.6,
+) -> pd.DataFrame:
+    """Gower mixed-type similarity (Strategy B).
+
+    Per-feature normalized L1 for numeric, 0/1 match for categorical, then
+    weighted average. Returns a single DataFrame indexed by model name.
+
+    Parameters
+    ----------
+    numeric_weight : float
+        w ∈ [0, 1]. w=0.6 → numeric gets 60% weight, categorical gets 40%.
+    """
+    names = list(model_physics.keys())
+    n = len(names)
+    if n < 2:
+        return pd.DataFrame(index=names, columns=names, dtype=float)
+
+    # Numeric block
+    Xnum_raw = np.array(
+        [[float(model_physics[m].get(f, 0.0)) for f in _HYBRID_NUMERIC_FEATURES]
+         for m in names],
+        dtype=float,
+    )
+    keep = Xnum_raw.std(axis=0) > 0
+    Xnum = _minmax_normalize_cols(Xnum_raw[:, keep])
+
+    # Numeric distance: mean over features of |x_i − x_j|
+    Dnum = np.zeros((n, n))
+    if Xnum.shape[1] > 0:
+        for j in range(Xnum.shape[1]):
+            col = Xnum[:, j:j + 1]
+            Dnum += np.abs(col - col.T)
+        Dnum /= Xnum.shape[1]
+
+    # Categorical distance: 0 if same, 1 if different (mean over 2 cats)
+    geom_vals = [model_physics[m]["geometry"] for m in names]
+    sb_vals = [_derive_side_branch_level(model_physics[m]) for m in names]
+    Dcat = np.zeros((n, n))
+    for vals in (geom_vals, sb_vals):
+        for i in range(n):
+            for k in range(n):
+                if vals[i] != vals[k]:
+                    Dcat[i, k] += 1.0
+    Dcat /= 2.0
+
+    w = float(np.clip(numeric_weight, 0.0, 1.0))
+    D = w * Dnum + (1.0 - w) * Dcat
+    S = np.clip(1.0 - D, 0.0, 1.0)
+    return pd.DataFrame(np.round(S, 4), index=names, columns=names)
+
+
+def compute_physics_based_model_association(
+    models_data: Dict[str, Dict[str, Any]],
+    categorical_weight: Optional[float] = None,
+) -> pd.DataFrame:
+    """Compute pairwise hybrid physics similarity between models.
+
+    v6.3.5: Now uses block-wise hybrid similarity (numeric cosine ⊕
+    categorical cosine) instead of numeric-only cosine. The returned
+    DataFrame includes three similarity columns so the reviewer can see
+    exactly *why* two models are close:
+      - Physics Similarity:     the combined score (1-α)·num + α·cat
+      - Numeric Similarity:     cosine on normalized numeric features
+      - Categorical Similarity: cosine on one-hot geometry ⊕ ordinal SB level
+
+    Parameters
+    ----------
+    categorical_weight : float, optional
+        α ∈ [0, 1]. If None, reads from ``st.session_state["qdwa_sim_alpha"]``
+        (default 0.4, set by the QDWA customization panel slider).
+    """
+    model_names = list(models_data.keys())
+    n_models = len(model_names)
+    if n_models < 2:
+        return pd.DataFrame(
+            columns=["Model", "Similar To", "Physics Similarity",
+                     "Numeric Similarity", "Categorical Similarity",
+                     "S/L Difference", "VM Stress Difference (MPa)"]
+        )
+
+    # Determine α: explicit arg → session_state → default 0.4
+    if categorical_weight is None:
+        categorical_weight = st.session_state.get("qdwa_sim_alpha", 0.4)
+
+    # Compute the three similarity matrices
+    blocks = physics_similarity_hybrid(models_data, categorical_weight)
+    Scomb = blocks["combined"].values
+    Snum = blocks["numeric"].values
+    Scat = blocks["categorical"].values
+
+    # Build the pairwise association table
+    assoc_data = []
+    for i, model_i in enumerate(model_names):
+        for j, model_j in enumerate(model_names):
+            if i != j:
+                vm_i = float(models_data[model_i].get("von_mises_stress_peak_gpa", 0)) * 1000
+                vm_j = float(models_data[model_j].get("von_mises_stress_peak_gpa", 0)) * 1000
+                assoc_data.append({
+                    "Model": model_i,
+                    "Similar To": model_j,
+                    "Physics Similarity": round(float(Scomb[i, j]), 4),
+                    "Numeric Similarity": round(float(Snum[i, j]), 4),
+                    "Categorical Similarity": round(float(Scat[i, j]), 4),
+                    "S/L Difference": round(
+                        abs(float(models_data[model_i]["s_l_ratio"])
+                            - float(models_data[model_j]["s_l_ratio"])), 3
+                    ),
+                    "VM Stress Difference (MPa)": round(abs(vm_i - vm_j), 1),
+                })
+    df = pd.DataFrame(assoc_data)
+    return df.sort_values(["Model", "Physics Similarity"], ascending=[True, False]).reset_index(drop=True)
+
+
+# ============================================================================
+# v6.3.3 — NUMERICAL MODEL MoE ANALYZER (Qwen3-30B-A3B)
+# ----------------------------------------------------------------------------
+# Uses the Qwen3-30B-A3B MoE model (30B total params, ~3B active per token)
+# for physics-grounded analysis of the 6 numerical models. The MoE
+# architecture gives 30B-class quality with sub-7B inference latency.
+# ============================================================================
+class NumericalModelMoEAnalyzer:
+    """Uses Qwen3-30B-A3B MoE for physics-grounded analysis of numerical models.
+
+    The MoE architecture activates ~3B params per token, giving 30B-class
+    quality with sub-7B latency — ideal for iterative physics reasoning.
+    Loaded in 4-bit NF4 quantization (~18 GB VRAM).
+    """
+
+    def __init__(self, model_name: str = "Qwen/Qwen3-30B-A3B-Instruct"):
+        self.model_name = model_name
+        self.tokenizer = None
+        self.model = None
+        self._loaded = False
+
+    def _load_model(self) -> None:
+        if self._loaded:
+            return
+        try:
+            if AutoTokenizer is None or AutoModelForCausalLM is None:
+                st.warning(
+                    "transformers not installed. Install with: "
+                    "pip install transformers accelerate bitsandbytes"
+                )
+                return
+            st.info(f"⏳ Loading MoE model: `{self.model_name}`… (~18 GB VRAM at 4-bit NF4)")
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                device_map="auto",
+                quantization_config=quantization_config,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
+            self._loaded = True
+            st.success(f"✅ MoE `{self.model_name}` loaded! (30B/3B active, 4-bit NF4)")
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load MoE `{self.model_name}`: {e}")
+            self._loaded = False
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def is_available(self) -> bool:
+        self._load_model()
+        return self._loaded
+
+    def _format_models_data(self, models_data: Dict[str, Dict[str, Any]]) -> str:
+        """Format numerical data for MoE model input as a readable text table."""
+        lines = []
+        for name in models_data:
+            p = models_data[name]
+            vm_gpa = float(p.get("von_mises_stress_peak_gpa", 0))
+            vm_mpa = vm_gpa * 1000
+            branch_count = int(p.get("branch_count", 0))
+            suppressed = p.get("side_branch_suppressed", False)
+            if suppressed and branch_count <= 2 and float(p.get('solid_fraction', 0)) >= 0.60:
+                supp = "High"
+            elif not suppressed and branch_count >= 5:
+                supp = "Low"
+            else:
+                supp = "Medium"
+            lines.append(f"{name}:")
+            lines.append(f"  Geometry: {p.get('geometry', '?')}")
+            lines.append(f"  S/L Ratio: {p.get('s_l_ratio', '?')}")
+            lines.append(f"  Solid Fraction: {float(p.get('solid_fraction', 0))*100:.0f}%")
+            lines.append(f"  Max Dendrite Length: {float(p.get('max_dendrite_length_pct', 0))*100:.0f}%")
+            lines.append(f"  Dendrite Area: {float(p.get('dendrite_area_pct', 0))*100:.0f}%")
+            lines.append(f"  Branch Count: {branch_count}")
+            lines.append(f"  Side Branch Suppression: {supp}")
+            lines.append(f"  VM Stress Peak: {vm_mpa:.1f} MPa ({vm_gpa:.3f} GPa)")
+            lines.append(f"  Time to Max Length: {p.get('time_to_max_length_s', '?')} s")
+            lines.append(f"  Young's Modulus (Solid/LLZO): {p.get('youngs_modulus_solid_gpa', '?')} GPa")
+            lines.append(f"  Young's Modulus (Liquid/LiPF6): {p.get('youngs_modulus_liquid_gpa', '?')} GPa")
+            lines.append(f"  Overpotential: {p.get('overpotential_mv', '?')} mV")
+            lines.append("")
+        return "\n".join(lines)
+
+    def analyze_solid_liquid_ratio_effects(self, models_data: Dict) -> str:
+        """Generate a physics-grounded answer about S/L ratio effects on
+        dendrite length and VM stress using the 30B MoE model."""
+        if not self.is_available():
+            return self._generate_fallback_answer(models_data)
+
+        data_summary = self._format_models_data(models_data)
+        prompt = f"""You are an expert in phase-field modeling of lithium dendrite growth in partitioned electrolytes.
+Given the numerical simulation data for 6 models with different solid-liquid ratios and geometries:
+
+{data_summary}
+
+Answer this query with physics-grounded reasoning:
+"How does the solid-liquid ratio in models A, B, C, D, E and F affect dendrite length and von Mises stress?"
+
+Requirements:
+1. Quantify the correlation between S/L ratio and VM stress (provide R² if possible)
+2. Explain why S/L ratio alone doesn't determine dendrite length (geometry matters)
+3. Discuss how side branching probability affects perpendicular length vs area fraction
+4. Reference specific values from the table (e.g., Model C: 97% length, 50 MPa stress)
+5. Explain the mechanical mechanism: higher solid fraction → stiffer boundaries → higher stress concentrations
+
+Provide a structured answer with:
+- Key Findings (bullet points)
+- Physical Mechanism (1-2 paragraphs)
+- Design Implications for battery engineers"""
+
+        try:
+            inputs = self.tokenizer(
+                prompt, return_tensors="pt"
+            ).to(self.model.device)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=1024,
+                    temperature=0.3,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+            response = self.tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True,
+            )
+            return response
+        except Exception as e:
+            st.warning(f"MoE generation failed: {e}")
+            return self._generate_fallback_answer(models_data)
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _generate_fallback_answer(self, models_data: Dict) -> str:
+        """Rule-based fallback when the MoE model is unavailable.
+        Produces the same structured answer using hardcoded physics reasoning."""
+        nl = "\n"
+        answer = "### Physics-Grounded Answer (Fallback — MoE model unavailable)" + nl + nl
+        answer += "**Key Findings:**" + nl
+        answer += (
+            "- **VM Stress shows strong positive correlation with S/L ratio**: "
+            "Higher solid fraction → more stiff LLZO boundaries (E=155 GPa) → "
+            "higher stress concentrations at solid-liquid interfaces." + nl
+        )
+        answer += (
+            "- **Dendrite Length does NOT correlate with S/L ratio alone** — "
+            "Geometry type is the dominant factor: Central Layer allows needle-like "
+            "main branches (Model C: 97%), Boundary Layer confines growth (Model A: 88%)." + nl
+        )
+        answer += (
+            "- **Side branching as energy dissipation**: High suppression (few branches) "
+            "→ energy focused on main trunk → higher perpendicular length. Low suppression "
+            "→ bushy growth → higher area fraction." + nl + nl
+        )
+        answer += "**Physical Mechanism:**" + nl + nl
+        answer += (
+            "The solid-liquid ratio controls the volume fraction of stiff LLZO partitions "
+            "(E=155 GPa) vs. compliant liquid electrolyte (E=0.877 GPa). Higher S/L ratio "
+            "means more solid phase, which increases VM stress via the stiffness mismatch "
+            "at interfaces. However, it does not necessarily suppress dendrite length — "
+            "the spatial arrangement determines whether dendrites can find continuous "
+            "liquid pathways. The eigenstrain from lithium deposition (V1=-0.866×10⁻³) "
+            "generates higher elastic strain energy in stiffer regions, raising the "
+            "mechanical free-energy barrier." + nl + nl
+        )
+        answer += "**Design Implications:**" + nl
+        answer += (
+            "- For maximum suppression: Boundary Layer with S/L ≥ 3:2 (Model A: 88% length, 59 MPa)" + nl
+        )
+        answer += (
+            "- For balanced performance: Central Layer with S/L = 2:3 (Model F: 93% length, 30 MPa)" + nl
+        )
+        answer += (
+            "- Avoid: Alternating Layers with low S/L (Model E: 92% length, 8.8% area — high dead lithium risk)" + nl
+        )
+        return answer
+
+    def unload_model(self) -> None:
+        if self.model is not None:
+            del self.model
+        if self.tokenizer is not None:
+            del self.tokenizer
+        self.model = None
+        self.tokenizer = None
+        self._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ============================================================================
+# v6.3.3 — NUMERICAL MODEL PHYSICS Q&A TAB (MoE-powered)
+# ============================================================================
+def render_numerical_model_physics_qa(theme: Optional[Dict[str, Any]] = None) -> None:
+    """Render the MoE-powered physics Q&A tab for numerical model analysis."""
+    if theme is None:
+        theme = THEME_PRESETS["Bright (Default)"]
+
+    st.header("Numerical Model Physics Q&A (Qwen3-30B-A3B MoE)")
+    st.caption(
+        "Uses the 30B MoE model (3B active params per token, ~18 GB VRAM at "
+        "4-bit NF4) for physics-grounded analysis of the 6 numerical models. "
+        "Falls back to a rule-based answer if the MoE model is unavailable."
+    )
+
+    # Cache the analyzer in session_state
+    if "moe_analyzer" not in st.session_state:
+        st.session_state.moe_analyzer = NumericalModelMoEAnalyzer(
+            model_name="Qwen/Qwen3-30B-A3B-Instruct"
+        )
+    analyzer = st.session_state.moe_analyzer
+
+    query = st.text_area(
+        "Enter your physics query:",
+        value=(
+            "How does the solid-liquid ratio in models A, B, C, D, E and F "
+            "affect dendrite length and von Mises stress?"
+        ),
+        height=80,
+        key="moe_physics_query_input",
+    )
+
+    if st.button("🧠 Analyze with 30B MoE", type="primary", key="moe_analyze_btn"):
+        if not query.strip():
+            st.warning("Please enter a query.")
+            return
+        all_physics = get_all_model_physics()
+        with st.spinner(
+            "Loading 30B MoE model and generating physics-grounded answer…"
+        ):
+            answer = analyzer.analyze_solid_liquid_ratio_effects(all_physics)
+        st.markdown("### 💡 Physics-Grounded Answer")
+        st.markdown(answer)
+
+        # Show physics-based model association table
+        st.markdown("### 🔗 Physics-Based Model Association")
+        st.caption(
+            "Cosine similarity between models based on normalized numerical "
+            "physics features. Higher = more similar in growth behavior and "
+            "mechanical response."
+        )
+        assoc_df = compute_physics_based_model_association(all_physics)
+        st.dataframe(assoc_df, width="stretch", hide_index=True)
+
+        # Show corrected radar chart
+        st.markdown("### 📊 Model Comparison Radar (Corrected VM Stress)")
+        _render_corrected_radar_chart(all_physics, theme)
+
+    # Unload button (frees VRAM)
+    if analyzer._loaded:
+        if st.button("🗑️ Unload MoE Model (free VRAM)", key="moe_unload_btn"):
+            analyzer.unload_model()
+            st.success("MoE model unloaded. VRAM freed.")
+            st.rerun()
+
+
+def _render_corrected_radar_chart(
+    all_physics: Dict[str, Dict[str, Any]], theme: Dict[str, Any]
+) -> None:
+    """Render the corrected radar chart with VM stress in GPa (not the
+    non-existent MPa field)."""
+    radar_metrics = [
+        ("max_dendrite_length_pct", "Dendrite Length"),
+        ("dendrite_area_pct", "Dendrite Area"),
+        ("von_mises_stress_peak_gpa", "VM Stress"),
+        ("branch_count", "Branch Count"),
+        ("s_l_ratio", "S/L Ratio"),
+        ("time_to_max_length_s", "Time to Max"),
+    ]
+    raw_values = {label: [] for _, label in radar_metrics}
+    for name in NUMERICAL_MODEL_NAMES:
+        p = all_physics[name]
+        for field, label in radar_metrics:
+            raw_values[label].append(float(p.get(field, 0.0)))
+    norm_values = {}
+    for label, vals in raw_values.items():
+        vmax = max(vals) if vals and max(vals) > 0 else 1.0
+        vmin = min(vals) if vals else 0.0
+        rng = max(vmax - vmin, 1e-9)
+        norm_values[label] = [(v - vmin) / rng for v in vals]
+
+    fig = go.Figure()
+    for i, name in enumerate(NUMERICAL_MODEL_NAMES):
+        r_vals = [norm_values[label][i] for _, label in radar_metrics]
+        r_vals_closed = r_vals + [r_vals[0]]
+        theta = [label for _, label in radar_metrics] + [radar_metrics[0][1]]
+        fig.add_trace(go.Scatterpolar(
+            r=r_vals_closed,
+            theta=theta,
+            fill="toself",
+            name=name,
+            opacity=0.6,
+            line=dict(width=2),
+        ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 1.05]),
+            angularaxis=dict(tickfont=dict(size=11)),
+        ),
+        showlegend=True,
+        title="6-Model Normalized Physics (VM Stress corrected: GPa field)",
+        paper_bgcolor=theme.get("plotly_paper", "#ffffff"),
+        font_color=theme.get("font", "#000000"),
+        height=480,
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+class LLMQueryAnalyzerFactory:
+    def __init__(self):
+        self._openai_cache: Optional[OpenAIQueryAnalyzer] = None
+        self._local_cache: Dict[str, LocalLLMQueryAnalyzer] = {}
+        self._ollama_cache: Dict[str, OllamaQueryAnalyzer] = {}
+        self._fallback = FallbackAnalyzer()
+
+    def get_analyzer(
+        self,
+        mode: str = "auto",
+        api_key: str = None,
+        local_model: str = None,
+        backend: str = None,
+    ) -> LLMQueryAnalyzer:
+        # v6.4: explicit Ollama backend shortcut.
+        if backend == "ollama" and local_model:
+            if local_model not in self._ollama_cache:
+                self._ollama_cache[local_model] = OllamaQueryAnalyzer(
+                    model_tag=local_model
+                )
+            return self._ollama_cache[local_model]
+
+        if mode == "openai":
+            if self._openai_cache is None:
+                self._openai_cache = OpenAIQueryAnalyzer(api_key=api_key)
+            return self._openai_cache
+        elif mode == "local":
+            model = local_model
+            if model is None:
+                return self._fallback
+            # Auto-detect if this is an Ollama tag (no slash, looks like "name:tag")
+            if (
+                backend is None
+                and OLLAMA_AVAILABLE
+                and "/" not in model
+                and ":" in model
+                and _ollama_has_model(model)
+            ):
+                if model not in self._ollama_cache:
+                    self._ollama_cache[model] = OllamaQueryAnalyzer(model_tag=model)
+                return self._ollama_cache[model]
+            if model not in self._local_cache:
+                self._local_cache[model] = LocalLLMQueryAnalyzer(model)
+            return self._local_cache[model]
+        elif mode == "fallback":
+            return self._fallback
+        else:  # auto
+            # Prefer Ollama if running and a model is selected
+            if (
+                OLLAMA_AVAILABLE
+                and _check_ollama_available()["running"]
+                and local_model
+            ):
+                if _ollama_has_model(local_model):
+                    if local_model not in self._ollama_cache:
+                        self._ollama_cache[local_model] = OllamaQueryAnalyzer(
+                            model_tag=local_model
+                        )
+                    return self._ollama_cache[local_model]
+            if self._openai_cache is None:
+                self._openai_cache = OpenAIQueryAnalyzer(api_key=api_key)
+            if self._openai_cache.is_available():
+                return self._openai_cache
+            model = local_model
+            if model is None:
+                return self._fallback
+            if model not in self._local_cache:
+                self._local_cache[model] = LocalLLMQueryAnalyzer(model)
+            if self._local_cache[model].is_available():
+                return self._local_cache[model]
+            return self._fallback
+
+# -----------------------------------------------------------------------------
+# DYNAMIC ONTOLOGY EXPANDER
+# -----------------------------------------------------------------------------
+class DynamicOntologyExpander:
+    REL_STR_TO_ENUM = {r.value: r for r in RelationshipType}
+    for _k, _v in list(REL_STR_TO_ENUM.items()):
+        REL_STR_TO_ENUM[_k.upper()] = _v
+    TYPE_STR_TO_ENUM = {t.value: t for t in ConceptType}
+
+    def __init__(self, ontology: Any):
+        self.ontology = ontology
+        self.mutation_log: List[Dict[str, Any]] = []
+        self.session_concepts_added: Set[str] = set()
+        self.session_relationships_added: List[Tuple[str, str, RelationshipType, float]] = []
+        self.query_bridge_concepts: Dict[str, str] = {}
+        self.priority_overrides: Dict[str, float] = {}
+        self._base_concept_count = len(ontology.concepts)
+        self._base_rel_count = len(ontology.relationships)
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        return {"base_concepts": self._base_concept_count, "base_relationships": self._base_rel_count,
+                "concepts_added": len(self.session_concepts_added), "relationships_added": len(self.session_relationships_added),
+                "bridge_concepts": len(self.query_bridge_concepts), "total_mutations": len(self.mutation_log)}
+
+    def apply_query_analysis(self, analysis: QueryAnalysisResult, analyzer: LLMQueryAnalyzer = None) -> Dict[str, Any]:
+        changes = {"concepts_added": [], "relationships_added": [], "bridges_created": []}
+        for concept_name, priority in analysis.concept_priorities.items():
+            if concept_name in self.ontology.concepts:
+                self.priority_overrides[concept_name] = priority.composite_score
+
+        new_concepts_raw = getattr(analyzer, '_pending_new_concepts', []) if hasattr(analyzer, '_pending_new_concepts') else []
+        new_rels_raw = getattr(analyzer, '_pending_new_relationships', []) if hasattr(analyzer, '_pending_new_relationships') else []
+
+        for concept_data in new_concepts_raw:
+            result = self._add_concept_from_llm(concept_data, analysis.original_query)
+            if result:
+                changes["concepts_added"].append(result)
+        for rel_data in new_rels_raw:
+            result = self._add_relationship_from_llm(rel_data, analysis.original_query)
+            if result:
+                changes["relationships_added"].append(result)
+
+        for concept in analysis.inferred_concepts:
+            if concept not in self.ontology.concepts:
+                bridge_result = self._create_bridge_concept(concept, analysis.original_query, analysis.primary_problem)
+                if bridge_result:
+                    changes["bridges_created"].append(bridge_result)
+
+        self.ontology._build_synonym_index()
+        return changes
+
+    def _add_concept_from_llm(self, concept_data: Dict, source_query: str) -> Optional[Dict]:
+        name = concept_data.get("name", "").strip().lower().replace(" ", "_")
+        if not name or name in self.ontology.concepts or name in self.session_concepts_added:
+            return None
+        concept_type = self.TYPE_STR_TO_ENUM.get(concept_data.get("type", "general"), ConceptType.GENERAL)
+        synonyms = set(s.lower().strip() for s in concept_data.get("synonyms", []) if isinstance(s, str))
+        definition = concept_data.get("definition", f"LLM-inferred concept from query: {source_query}")
+
+        self.ontology._add_concept(name, concept_type, synonyms=synonyms, definition=definition)
+        self.ontology.synonym_to_canonical[name.lower()] = name
+        for syn in synonyms:
+            self.ontology.synonym_to_canonical[syn] = name
+        self.session_concepts_added.add(name)
+
+        for rel_tuple in concept_data.get("relate_to", []):
+            if len(rel_tuple) >= 2:
+                target, rel_type_str = rel_tuple[0], rel_tuple[1] if len(rel_tuple) > 1 else "influences"
+                conf = float(rel_tuple[2]) if len(rel_tuple) > 2 else 0.7
+                rel_enum = self.REL_STR_TO_ENUM.get(rel_type_str, RelationshipType.INFLUENCES)
+                if target in self.ontology.concepts:
+                    self.ontology.relationships.append(Relationship(name, target, rel_enum, conf))
+                    self.session_relationships_added.append((name, target, rel_enum, conf))
+
+        self.mutation_log.append({"type": "add_concept", "concept": name, "concept_type": concept_type.value, "source_query": source_query})
+        return {"name": name, "type": concept_type.value, "synonyms": list(synonyms)}
+
+    def _add_relationship_from_llm(self, rel_data: List, source_query: str) -> Optional[Dict]:
+        if len(rel_data) < 3:
+            return None
+        source, rel_type_str, target = str(rel_data[0]).strip().lower().replace(" ", "_"), str(rel_data[1]).upper(), str(rel_data[2]).strip().lower().replace(" ", "_")
+        confidence = float(rel_data[3]) if len(rel_data) > 3 else 0.7
+        if source not in self.ontology.concepts or target not in self.ontology.concepts:
+            return None
+        rel_enum = self.REL_STR_TO_ENUM.get(rel_type_str, RelationshipType.INFLUENCES)
+        self.ontology.relationships.append(Relationship(source, target, rel_enum, confidence))
+        self.session_relationships_added.append((source, target, rel_enum, confidence))
+        self.mutation_log.append({"type": "add_relationship", "source": source, "target": target, "rel_type": rel_enum.value, "source_query": source_query})
+        return {"source": source, "target": target, "rel_type": rel_enum.value, "confidence": confidence}
+
+    def _create_bridge_concept(self, missing_concept: str, source_query: str, problem: BatteryProblem) -> Optional[Dict]:
+        bridge_name = f"query_bridge_{missing_concept.replace(' ', '_').lower()}"
+        if bridge_name in self.ontology.concepts:
+            return None
+        pdef = DENDRITE_RESEARCH_PROBLEMS.get(problem, DENDRITE_RESEARCH_PROBLEMS[BatteryProblem.GENERAL])
+        self.ontology._add_concept(bridge_name, ConceptType.GENERAL, synonyms={missing_concept.lower()}, definition=f"Query-inferred bridge: '{missing_concept}'")
+        self.ontology.synonym_to_canonical[bridge_name] = bridge_name
+        self.ontology.synonym_to_canonical[missing_concept.lower()] = bridge_name
+
+        connected = []
+        for key_concept in pdef.key_concepts[:3]:
+            if key_concept in self.ontology.concepts:
+                self.ontology.relationships.append(Relationship(bridge_name, key_concept, RelationshipType.BRIDGE, 0.5))
+                self.session_relationships_added.append((bridge_name, key_concept, RelationshipType.BRIDGE, 0.5))
+                connected.append(key_concept)
+        self.session_concepts_added.add(bridge_name)
+        self.query_bridge_concepts[bridge_name] = source_query
+        self.mutation_log.append({"type": "create_bridge", "bridge_name": bridge_name, "original_term": missing_concept, "connected_to": connected})
+        return {"bridge": bridge_name, "for": missing_concept, "connected_to": connected}
+
+    def get_priority_boosted_scores(self, base_priorities: Dict[str, ConceptPriority]) -> Dict[str, ConceptPriority]:
+        boosted = {}
+        for name, priority in base_priorities.items():
+            boost = self.priority_overrides.get(name, 0.0)
+            if boost > 0:
+                bp = copy.deepcopy(priority)
+                bp.composite_score = min(bp.composite_score + boost * 0.2, 1.0)
+                bp.causal_path_score = boost * 0.2
+                boosted[name] = bp
+            else:
+                boosted[name] = priority
+        return boosted
+
+    def undo_last_mutation(self) -> Optional[Dict]:
+        if not self.mutation_log:
+            return None
+        mutation = self.mutation_log.pop()
+        if mutation["type"] == "add_concept":
+            name = mutation["concept"]
+            if name in self.ontology.concepts:
+                del self.ontology.concepts[name]
+                self.session_concepts_added.discard(name)
+                self.ontology.relationships = [r for r in self.ontology.relationships if r.source != name and r.target != name]
+        elif mutation["type"] == "add_relationship":
+            self.ontology.relationships = [r for r in self.ontology.relationships if not (r.source == mutation["source"] and r.target == mutation["target"] and r.rel_type.value == mutation["rel_type"])]
+        elif mutation["type"] == "create_bridge":
+            bridge_name = mutation["bridge_name"]
+            if bridge_name in self.ontology.concepts:
+                del self.ontology.concepts[bridge_name]
+                self.session_concepts_added.discard(bridge_name)
+                self.query_bridge_concepts.pop(bridge_name, None)
+        self.ontology._build_synonym_index()
+        return mutation
+
+    def reset_to_base(self) -> Dict[str, int]:
+        for name in list(self.session_concepts_added):
+            if name in self.ontology.concepts:
+                del self.ontology.concepts[name]
+        self.ontology.relationships = self.ontology.relationships[:self._base_rel_count]
+        self.session_concepts_added.clear()
+        self.session_relationships_added.clear()
+        self.query_bridge_concepts.clear()
+        self.priority_overrides.clear()
+        self.mutation_log.clear()
+        self.ontology._build_synonym_index()
+        return {"concepts_removed": len(self.session_concepts_added), "relationships_removed": len(self.ontology.relationships) - self._base_rel_count}
+
+
+# ============================================================================
+# PRIORITY-GUIDED SUBGRAPH EXTRACTOR (QDWA Enhanced)
+# ============================================================================
+class PriorityGuidedSubgraphExtractor:
+    def __init__(self, full_graph: nx.Graph, ontology: Any, expander: DynamicOntologyExpander):
+        self.full_graph = full_graph
+        self.ontology = ontology
+        self.expander = expander
+
+    def extract(self, analysis: QueryAnalysisResult, query_embedding: np.ndarray = None) -> nx.Graph:
+        raw_seed_nodes = set(analysis.focus_nodes + analysis.get_concepts_above_threshold())
+        seed_nodes = {n for n in raw_seed_nodes if n in self.full_graph}
+        if not seed_nodes:
+            seed_nodes = {n for n, d in self.full_graph.nodes(data=True) if d.get("priority_score", 0) >= 0.3}
+
+        W = getattr(analysis, "category_weights", None) or {k: 0.25 for k in FOUR_CATEGORIES}
+        k_star = max(W, key=W.get)
+        rho, eta, kappa = 0.15, 0.5, 0.5
+
+        G2 = self.full_graph.copy()
+        for u, v, d in G2.edges(data=True):
+            cu, cv = categorize_dendrite_concept(u), categorize_dendrite_concept(v)
+            boost = 1.0 + eta * W.get(cu, 0.0) * (1 if cu == cv else 0)
+            if d.get("edge_type", "") in ("causes", "depends_on", "influences"):
+                boost += kappa * W.get(cv, 0.0)
+            d["weight"] = d.get("weight", 1.0) * boost
+
+        personalization = {
+            n: (1.0 if n in seed_nodes else 0.0)
+            + rho * W.get(categorize_dendrite_concept(n), 0.0)
+            for n in G2.nodes()
+        }
+        try:
+            ppr_scores = nx.pagerank(G2, personalization=personalization, alpha=0.85)
+        except Exception:
+            ppr_scores = {n: 1.0 / len(G2) for n in G2}
+
+        for node in self.full_graph.nodes():
+            ppr = ppr_scores.get(node, 0.0)
+            srs = self._compute_semantic_resonance(node, query_embedding) if query_embedding is not None else 0.5
+            combined = 0.6 * ppr + 0.4 * srs
+            self.full_graph.nodes[node]["priority_score"] = combined
+            self.full_graph.nodes[node]["ppr_score"] = ppr
+            self.full_graph.nodes[node]["semantic_resonance"] = srs
+
+            if node in analysis.concept_priorities:
+                cp = analysis.concept_priorities[node]
+                self.full_graph.nodes[node]["is_explicit"] = cp.is_explicitly_mentioned
+                self.full_graph.nodes[node]["is_inferred"] = cp.is_inferred
+            elif node in self.expander.session_concepts_added:
+                self.full_graph.nodes[node]["is_explicit"] = False
+                self.full_graph.nodes[node]["is_inferred"] = True
+                self.full_graph.nodes[node]["is_llm_added"] = True
+            else:
+                self.full_graph.nodes[node]["is_explicit"] = False
+                self.full_graph.nodes[node]["is_inferred"] = False
+
+        threshold = 0.1
+        selected_nodes = {n for n, d in self.full_graph.nodes(data=True) if d.get("priority_score", 0) >= threshold}
+        selected_nodes.update(seed_nodes)
+
+        K = max(1, getattr(analysis, "subgraph_depth", 2))
+        frontier = set(selected_nodes)
+        for _ in range(K - 1):
+            nxt = set()
+            for n in frontier:
+                for nb in self.full_graph.neighbors(n):
+                    if nb in selected_nodes:
+                        continue
+                    ncat = {categorize_dendrite_concept(x) for x in self.full_graph.neighbors(nb)}
+                    if categorize_dendrite_concept(nb) == k_star or (len(ncat) >= 2 and self.full_graph.degree(nb) > 2):
+                        nxt.add(nb)
+            selected_nodes |= nxt
+            frontier = nxt
+
+        subgraph = self.full_graph.subgraph(selected_nodes).copy()
+        return subgraph
+
+    def _compute_semantic_resonance(self, concept: str, query_emb: np.ndarray) -> float:
+        embed_model = st.session_state.get('embed_model')
+        if embed_model is None:
+            return 0.5
+        try:
+            concept_emb = embed_model.encode(concept, convert_to_numpy=True)
+            sim = np.dot(query_emb, concept_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(concept_emb) + 1e-8)
+            return float(np.clip(sim, 0, 1))
+        except Exception:
+            return 0.5
+
+
+# ============================================================================
+# GRAPH‑RAG ANSWER GENERATOR
+# ============================================================================
+class GraphRAGAnswerGenerator:
+    def __init__(self, analyzer: LLMQueryAnalyzer):
+        self.analyzer = analyzer
+
+    def generate_ground_response(self, query: str, analysis: QueryAnalysisResult, subgraph: nx.Graph,
+                                 concept_abstract_map: Dict[str, List[int]], all_texts: Union[List[str], Dict[int, str]],
+                                 max_docs_per_concept: int = 2, latex_context: str = "") -> str:
+        top_nodes = sorted(subgraph.nodes(data=True), key=lambda x: x[1].get("priority_score", 0.0), reverse=True)[:5]
+        evidence_snippets = []
+        for node, attrs in top_nodes:
+            doc_indices = concept_abstract_map.get(node, [])[:max_docs_per_concept]
+            for idx in doc_indices:
+                if isinstance(all_texts, dict):
+                    text = all_texts.get(idx, "")
+                else:
+                    text = all_texts[idx] if 0 <= idx < len(all_texts) else ""
+                if text:
+                    clean_text = re.sub(r'\s+', ' ', text).strip()[:400]
+                    evidence_snippets.append("- **" + node + "**: " + clean_text + "...")
+        nl = chr(10)
+        prompt = "You are an expert in dendrite growth in partitioned electrolytes (phase-field modeling of lithium-metal electrodes with solid partitions). Answer the user's query based *strictly* on the provided graph context and evidence snippets." + nl
+        prompt += "User Query: " + repr(query) + nl
+        if latex_context.strip():
+            # Include the user-provided LaTeX/text notes so the grounded answer
+            # can reference symbols, equations, or definitions the user attached.
+            prompt += "User-Provided LaTeX/Text Context:" + nl + latex_context[:1500] + nl
+        prompt += "Identified Core Problem: " + analysis.primary_problem.value.replace("_", " ").title() + nl
+        if getattr(analysis, "category_weights", None):
+            prompt += "Category focus weights (W): " + ", ".join(f"{k}={v:.2f}" for k, v in analysis.category_weights.items()) + nl
+        prompt += "Key Graph Concepts: " + ", ".join([n for n, _ in top_nodes]) + nl
+        prompt += "Evidence Snippets from Literature:" + nl
+        if evidence_snippets:
+            prompt += nl.join(evidence_snippets) + nl
+        else:
+            prompt += "No direct text snippets found. Rely on your general knowledge of dendrite growth in partitioned electrolytes but note the lack of specific retrieved context." + nl
+        prompt += "Instructions:" + nl
+        prompt += "1. Provide a direct, scientifically accurate answer (2-3 paragraphs)." + nl
+        prompt += "2. Explicitly mention how the key concepts interact (e.g., causal chains like 'higher Young's modulus raises von Mises stress, which suppresses dendrite length')." + nl
+        prompt += "3. If the retrieved evidence is insufficient, state what specific data is missing."
+
+        if isinstance(self.analyzer, OpenAIQueryAnalyzer) and self.analyzer.is_available():
+            return self._call_llm_for_answer(prompt, self.analyzer, query, analysis, top_nodes, evidence_snippets)
+        return self._generate_fallback_answer(query, analysis, top_nodes, evidence_snippets)
+
+    def _call_llm_for_answer(self, prompt: str, analyzer: LLMQueryAnalyzer, query: str, analysis: QueryAnalysisResult, top_nodes, evidence_snippets) -> str:
+        client = analyzer._get_client()
+        if client:
+            try:
+                response = client.chat.completions.create(
+                    model=analyzer.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=800
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                fallback_text = self._generate_fallback_answer(query, analysis, top_nodes, evidence_snippets)
+                return "⚠️ LLM API Error: " + str(e) + chr(10) + chr(10) + fallback_text
+        return self._generate_fallback_answer(query, analysis, top_nodes, evidence_snippets)
+
+    def _generate_fallback_answer(self, query: str, analysis: Optional[QueryAnalysisResult], top_nodes, snippets: List[str]) -> str:
+        nl = chr(10)
+        fallback_text = "### Analysis of: '" + query + "'" + nl + nl
+        if analysis is not None:
+            primary = getattr(analysis, 'primary_problem', None)
+            fallback_text += "**Core Problem Identified:** " + (primary.value.replace('_', ' ').title() if primary else 'Unknown') + nl + nl
+        else:
+            fallback_text += "**Core Problem Identified:** (analysis unavailable)" + nl + nl
+        fallback_text += "**Key Concepts in Focus:**" + nl
+        fallback_text += nl.join(["- **" + node + "** (" + attrs.get("concept_type", "general") + "): Priority Score " + str(round(attrs.get("priority_score", 0), 2)) for node, attrs in top_nodes])
+        if snippets:
+            fallback_text += nl + "**Retrieved Evidence Context:**" + nl + nl.join(snippets[:3]) + nl
+        else:
+            fallback_text += nl + "*Note: No direct text snippets were linked to these concepts in the current dataset.*" + nl
+        fallback_text += nl + "**System Reasoning Chain:**" + nl
+        if analysis is not None:
+            reasoning_chain = getattr(analysis, 'reasoning_chain', [])
+            fallback_text += nl.join(["- " + step for step in reasoning_chain])
+        else:
+            fallback_text += "- No reasoning chain available (analysis was None)." + nl
+        return fallback_text
+
+
+# ============================================================================
+# QUERY SESSION MANAGER
+# ============================================================================
+class QuerySessionManager:
+    SESSION_KEY = "dendrite_query_session"
+    @classmethod
+    def init_session(cls) -> Dict[str, Any]:
+        if cls.SESSION_KEY not in st.session_state:
+            st.session_state[cls.SESSION_KEY] = {"query_history": [], "analysis_history": [], "mutation_history": [], "analyzer_mode": "auto", "total_concepts_added": 0, "total_relationships_added": 0}
+        return st.session_state[cls.SESSION_KEY]
+
+    @classmethod
+    def record_query(cls, query: str, analysis: QueryAnalysisResult, mutations: Dict[str, Any]) -> None:
+        session = cls.init_session()
+        session["query_history"].append(query)
+        session["analysis_history"].append({"query": query, "primary_problem": analysis.primary_problem.value, "query_type": analysis.query_type, "concepts_found": len(analysis.all_relevant_concepts), "explicit": len(analysis.explicitly_mentioned), "inferred": len(analysis.inferred_concepts), "confidence": analysis.confidence, "timestamp": datetime.now().isoformat()})
+        session["mutation_history"].append({"query": query, "concepts_added": len(mutations.get("concepts_added", [])), "relationships_added": len(mutations.get("relationships_added", [])), "bridges_created": len(mutations.get("bridges_created", [])), "timestamp": datetime.now().isoformat()})
+        session["total_concepts_added"] += len(mutations.get("concepts_added", []))
+        session["total_relationships_added"] += len(mutations.get("relationships_added", []))
+
+    @classmethod
+    def get_session(cls) -> Dict[str, Any]:
+        return cls.init_session()
+    @classmethod
+    def clear_session(cls) -> None:
+        if cls.SESSION_KEY in st.session_state:
+            del st.session_state[cls.SESSION_KEY]
+
+
+# ============================================================================
+# QDWA — Query Distillation & Weighted Allocation (FULL IMPLEMENTATION)
+# ============================================================================
+from typing import List, Dict, Tuple, Optional, Any
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+import hashlib
+
+QDWA_CATEGORIES = {
+    "Structural_Geometry": [
+        "solid_liquid_ratio", "spatial_configuration", "horizontal_layering",
+        "vertical_stripes", "random_inclusions", "domain_size",
+    ],
+    "Phase_Properties": [
+        "youngs_modulus", "poissons_ratio", "ionic_conductivity",
+        "order_parameter_eta", "order_parameter_phi", "gradient_energy_coefficient",
+    ],
+    "Electrochemical_Kinetics": [
+        "butler_volmer_kinetics", "overpotential", "ionic_concentration",
+        "nucleation_perturbation", "chemical_free_energy",
+    ],
+    "Mechanical_Constraints": [
+        "von_mises_stress", "mechanical_free_energy", "eigenstrain",
+        "elastic_strain_energy", "mechanical_suppression",
+    ],
+    # v6.3 — 5th pillar: the 6 numerical models themselves.
+    "Numerical_Models": [
+        "model_a", "model_b", "model_c", "model_d", "model_e", "model_f",
+    ],
+}
+
+CATEGORY_SHORT_NAMES = {
+    "Structural_Geometry": "Geometry",
+    "Phase_Properties": "Phase Props",
+    "Electrochemical_Kinetics": "Electrochem",
+    "Mechanical_Constraints": "Mechanics",
+    "Numerical_Models": "Models A–F",
+}
+
+CATEGORY_COLORS = {
+    "Structural_Geometry":          "#3B82F6",
+    "Phase_Properties":             "#F59E0B",
+    "Electrochemical_Kinetics":     "#10B981",
+    "Mechanical_Constraints":       "#EF4444",
+    "Numerical_Models":             "#8B5CF6",
+}
+
+
+class QDWAWeightAllocator:
+    """
+    Query Distillation & Weighted Allocation engine.
+
+    Given a user query and a pre-built DomainOntology with embeddings,
+    computes a 5-category weight vector (α₁…α₅) that sums to 1.
+
+    v6.3: The 5th category `Numerical_Models` is seeded by the 6 manuscript
+    model concepts (model_a … model_f); queries mentioning "Model A",
+    "horizontal layering 4:1", etc. will route weight to this pillar.
+    """
+
+    def __init__(
+        self,
+        ontology: "DomainOntology",
+        encoder: "SentenceTransformer",
+        temperature: float = 0.15,
+        keyword_boost: float = 0.30,
+    ):
+        self.ontology = ontology
+        self.encoder = encoder
+        self.temperature = temperature
+        self.keyword_boost = keyword_boost
+        self._centroids: Optional[Dict[str, np.ndarray]] = None
+        self._last_query: str = ""
+        self._last_weights: Dict[str, float] = {}
+        self._last_raw_scores: Dict[str, float] = {}
+        self._last_keyword_hits: Dict[str, int] = {}
+        self._last_query_embedding: Optional[np.ndarray] = None
+
+    def build_centroids(self) -> None:
+        """Pre-compute category centroid embeddings."""
+        self._centroids = {}
+        for cat_name, concept_keys in QDWA_CATEGORIES.items():
+            embeddings = []
+            for key in concept_keys:
+                node = self.ontology.concepts.get(key)
+                if node is not None and node.embedding is not None:
+                    embeddings.append(node.embedding)
+                else:
+                    emb = self.encoder.encode(
+                        key.replace("_", " "), normalize_embeddings=True
+                    )
+                    embeddings.append(emb)
+            if embeddings:
+                centroid = np.mean(embeddings, axis=0)
+                centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+                self._centroids[cat_name] = centroid
+
+    @property
+    def centroids(self) -> Dict[str, np.ndarray]:
+        if self._centroids is None:
+            self.build_centroids()
+        return self._centroids
+
+    def compute_weights(self, query: str) -> Dict[str, float]:
+        """
+        Full QDWA pipeline: embed query → score → softmax → boost → normalize.
+        Returns dict  {category_full_name: weight_float}.
+        """
+        self._last_query = query
+        query_emb = self.encoder.encode(query, normalize_embeddings=True)
+        self._last_query_embedding = query_emb
+
+        raw_scores = {}
+        for cat_name, centroid in self.centroids.items():
+            sim = float(np.dot(query_emb, centroid))
+            raw_scores[cat_name] = sim
+        self._last_raw_scores = raw_scores
+
+        temp_scaled = {k: v / self.temperature for k, v in raw_scores.items()}
+        max_val = max(temp_scaled.values())
+        exp_vals = {k: np.exp(v - max_val) for k, v in temp_scaled.items()}
+        total_exp = sum(exp_vals.values())
+        weights = {k: v / total_exp for k, v in exp_vals.items()}
+
+        query_lower = query.lower()
+        keyword_hits = {}
+        for cat_name, concept_keys in QDWA_CATEGORIES.items():
+            hits = 0
+            for key in concept_keys:
+                node = self.ontology.concepts.get(key)
+                if key.replace("_", " ") in query_lower:
+                    hits += 1
+                if node:
+                    for syn in node.synonyms:
+                        if syn in query_lower:
+                            hits += 1
+            keyword_hits[cat_name] = hits
+        self._last_keyword_hits = keyword_hits
+
+        beta = self.keyword_boost
+        boosted = {
+            k: weights[k] * (1.0 + beta * keyword_hits[k])
+            for k in weights
+        }
+        total_boosted = sum(boosted.values())
+        final_weights = {k: v / total_boosted for k, v in boosted.items()}
+        self._last_weights = final_weights
+        return final_weights
+
+    @property
+    def weights(self) -> Dict[str, float]:
+        return self._last_weights
+
+    @property
+    def raw_scores(self) -> Dict[str, float]:
+        return self._last_raw_scores
+
+    @property
+    def keyword_hits(self) -> Dict[str, int]:
+        return self._last_keyword_hits
+
+    @property
+    def query_embedding(self) -> Optional[np.ndarray]:
+        return self._last_query_embedding
+
+    def get_major_category(self) -> Tuple[str, float]:
+        """Return (category_name, weight) of the highest-weight category."""
+        if not self._last_weights:
+            return ("N/A", 0.0)
+        return max(self._last_weights.items(), key=lambda x: x[1])
+
+    def get_ranked_categories(self) -> List[Tuple[str, float]]:
+        """Return categories sorted by weight descending."""
+        return sorted(self._last_weights.items(), key=lambda x: x[1], reverse=True)
+
+    def weights_dataframe(self) -> pd.DataFrame:
+        """Return a tidy DataFrame for display / plotting."""
+        rows = []
+        for cat, w in self._last_weights.items():
+            rows.append({
+                "Category": cat,
+                "Short Name": CATEGORY_SHORT_NAMES[cat],
+                "Weight": w,
+                "Raw Similarity": self._last_raw_scores.get(cat, 0.0),
+                "Keyword Hits": self._last_keyword_hits.get(cat, 0),
+                "Color": CATEGORY_COLORS[cat],
+                "Is Major": cat == self.get_major_category()[0],
+            })
+        return pd.DataFrame(rows)
+
+
+@st.cache_resource(show_spinner="Building QDWA weight allocator…")
+def init_qdwa_allocator(
+    _ontology: "DomainOntology",
+    _encoder: "SentenceTransformer",
+    temperature: float = 0.15,
+    keyword_boost: float = 0.30,
+) -> QDWAWeightAllocator:
+    allocator = QDWAWeightAllocator(
+        ontology=_ontology,
+        encoder=_encoder,
+        temperature=temperature,
+        keyword_boost=keyword_boost,
+    )
+    allocator.build_centroids()
+    return allocator
+
+
+def run_qdwa_and_show_weights(qdwa: QDWAWeightAllocator, query: str):
+    """Compute weights and render the numeric weight table."""
+    weights = qdwa.compute_weights(query)
+    df = qdwa.weights_dataframe()
+    major_cat, major_w = qdwa.get_major_category()
+
+    st.markdown("### 🎯 QDWA Category Weights")
+    # v6.3.2 FIX: was `st.columns(4)` + `cols[i]` which crashed with IndexError
+    # when the QDWA weight DataFrame grew to 5 rows (5th pillar: numerical_models).
+    # Now uses a chunked, index-agnostic layout that handles any number of
+    # categories and never relies on the DataFrame index being 0..n-1.
+    N_PER_ROW = 4  # visual: max 4 cards per row for readability
+    if df.empty:
+        st.info("No QDWA categories to display.")
+    else:
+        for chunk_start in range(0, len(df), N_PER_ROW):
+            chunk = df.iloc[chunk_start:chunk_start + N_PER_ROW]
+            cols = st.columns(len(chunk))
+            for col, (_, row) in zip(cols, chunk.iterrows()):
+                with col:
+                    is_major = row["Is Major"]
+                    border = "3px solid #FFD700" if is_major else "1px solid #333"
+                    st.markdown(
+                        f"""
+                        <div style="border:{border}; border-radius:8px; padding:12px;
+                                    background:{row['Color']}22; text-align:center;">
+                            <div style="font-size:12px; color:{row['Color']}; font-weight:600;">
+                                {row['Short Name']}
+                            </div>
+                            <div style="font-size:28px; font-weight:700; color:{row['Color']};
+                                        margin:4px 0;">
+                                {row['Weight']:.1%}
+                            </div>
+                            <div style="font-size:10px; color:#888;">
+                                raw={row['Raw Similarity']:.3f} · hits={int(row['Keyword Hits'])}
+                            </div>
+                            {"⭐ MAJOR" if is_major else ""}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+    with st.expander("📊 Weight detail table", expanded=False):
+        show_df = df.drop(columns=["Color"]).copy()
+        show_df["Weight"] = show_df["Weight"].map("{:.4f}".format)
+        show_df["Raw Similarity"] = show_df["Raw Similarity"].map("{:.4f}".format)
+        st.dataframe(show_df, width="stretch", hide_index=True)
+
+    return df, major_cat, major_w
+
+
+# ============================================================================
+# ENHANCED render_qdwa_tab (Methodology + Math + Customization)
+# ----------------------------------------------------------------------------
+# v6.2 FIX: consume the panel's returned dict instead of reading a widget key.
+# ============================================================================
+
+def render_qdwa_tab(qdwa: QDWAWeightAllocator, query: str, metrics: RunMetricsLogger):
+    """Full tab: compute weights → methodology highlight → charts → math."""
+    metrics.start_step("QDWA weight computation")
+    df, major_cat, major_w = run_qdwa_and_show_weights(qdwa, query)
+    metrics.end_step(extra={"major": major_cat, "major_weight": major_w})
+
+    # --- Customization Panel ---
+    post_params = render_qdwa_customization_panel()
+
+    # --- Methodology & Category Dominance Highlight ---
+    st.markdown("### 🧠 Methodology & Category Dominance")
+    W = qdwa.weights
+    H = -sum(w * math.log(w) for w in W.values() if w > 1e-12)
+    # v6.3.2 FIX: was `math.log(4)` (hardcoded for 4 pillars). Now uses
+    # `math.log(len(W))` so it generalizes to the 5-pillar case.
+    c = float(np.clip(1.0 - H / math.log(len(W)), 0.0, 1.0))
+
+    col_m1, col_m2 = st.columns([2, 1])
+    with col_m1:
+        if c > 0.6:
+            st.markdown(f"""
+            <div style="padding: 15px; border-radius: 8px; background: rgba(16, 185, 129, 0.1); border-left: 5px solid #10B981;">
+                <h4 style="margin:0; color:#065F46;">🎯 Major Category Focus (Specialized)</h4>
+                <p style="margin:5px 0 0 0; color:#047857;">
+                    The query is heavily dominated by <b>{major_cat}</b> ({major_w:.1%}).
+                    The system will prioritize deep-dive experts and causal chains in this domain.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+        elif c < 0.4:
+            st.markdown(f"""
+            <div style="padding: 15px; border-radius: 8px; background: rgba(59, 130, 246, 0.1); border-left: 5px solid #3B82F6;">
+                <h4 style="margin:0; color:#1E3A8A;">🌐 Plural / Multi-Disciplinary</h4>
+                <p style="margin:5px 0 0 0; color:#1E40AF;">
+                    The query spans multiple domains relatively equally. The system will activate cross-domain bridge concepts and broad routing.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="padding: 15px; border-radius: 8px; background: rgba(245, 158, 11, 0.1); border-left: 5px solid #F59E0B;">
+                <h4 style="margin:0; color:#78350F;">⚖️ Balanced Distribution</h4>
+                <p style="margin:5px 0 0 0; color:#92400E;">
+                    The query has a primary focus on <b>{major_cat}</b> but maintains strong relevance to secondary categories.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+    with col_m2:
+        st.metric("Concentration Index ($c$)", f"{c:.3f}")
+        st.caption("1.0 = Single Category\n0.0 = Uniform Plural")
+
+    st.markdown("---")
+
+    chart_options = ["📊 Bar Chart", "🍩 Donut Chart", "🕸️ Radar / Spider",
+                     "🔄 Sankey Flow (Simple)", "🌊 Two-Way Sankey (Terms→Cats)",
+                     "🎛️ Chord (Radial)", "🔥 Heatmap", "📈 All Charts (Gallery)"]
+    chosen = st.selectbox("Select visualization", chart_options, index=0)
+    metrics.start_step(f"QDWA chart: {chosen}")
+
+    # Use panel's returned colormap, never the raw widget-backed key.
+    scale = plotly_continuous_scale(post_params.get("cmap", "viridis"))
+
+    if "Bar" in chosen:
+        render_qdwa_bar(df, scale)
+    elif "Donut" in chosen:
+        render_qdwa_donut(df, scale)
+    elif "Radar" in chosen:
+        render_qdwa_radar(df, scale)
+    elif "Sankey" in chosen and "Two-Way" not in chosen:
+        render_qdwa_sankey(df, query, scale)
+    elif "Two-Way" in chosen:
+        render_qdwa_sankey_twoway(query, df, scale)
+    elif "Chord" in chosen:
+        render_qdwa_chord(df, scale)
+    elif "Heatmap" in chosen:
+        render_qdwa_heatmap(df, scale)
+    elif "Gallery" in chosen:
+        c1, c2 = st.columns(2)
+        with c1:
+            render_qdwa_bar(df, scale)
+        with c2:
+            render_qdwa_donut(df, scale)
+        render_qdwa_radar(df, scale)
+        c3, c4 = st.columns(2)
+        with c3:
+            render_qdwa_sankey(df, query, scale)
+        with c4:
+            render_qdwa_heatmap(df, scale)
+    metrics.end_step()
+
+    with st.expander("🧮 QDWA Mathematical Framework (Robust Explanation)", expanded=False):
+        st.markdown(r"""
+        #### 🧮 QDWA Mathematical Framework
+        The Query Distillation & Weighted Allocation (QDWA) strategy maps a natural language query $\mathbf{q}$ to an $N$-dimensional weight vector $\mathbf{W} = [\alpha_1, \alpha_2, \ldots, \alpha_N]$ (currently $N=5$) representing relevance to Structural Geometry, Phase Properties, Electrochemical Kinetics, Mechanical Constraints, and Numerical Models domains.
+
+        **Stage 1: Query Embedding**
+        $$ \mathbf{e}_q = f_{\text{enc}}(\mathbf{q}) \in \mathbb{R}^d $$
+        *Intuition:* The query is mapped to a dense semantic vector using a SentenceTransformer.
+
+        **Stage 2: Category Centroids**
+        $$ \mathbf{e}_{c_i} = \frac{1}{|S_i|} \sum_{j \in S_i} \mathbf{e}_j, \quad \hat{\mathbf{e}}_{c_i} = \frac{\mathbf{e}_{c_i}}{\|\mathbf{e}_{c_i}\|_2} $$
+        *Intuition:* Each category is represented by the normalized mean of its seed concept embeddings.
+
+        **Stage 3: Cosine Similarity & Temperature Softmax**
+        $$ s_i = \hat{\mathbf{e}}_q \cdot \hat{\mathbf{e}}_{c_i}, \quad \alpha_i = \frac{\exp(s_i / \tau)}{\sum_{j=1}^{N} \exp(s_j / \tau)} $$
+        *Intuition:* $\tau$ (temperature) controls the "sharpness" of the distribution. Low $\tau$ yields a one-hot-like distribution (strong major category), while high $\tau$ yields a uniform distribution (plural).
+
+        **Stage 4: Keyword Evidence Boost**
+        $$ \alpha_i^{\text{final}} = \frac{\alpha_i (1 + \beta \cdot k_i)}{\sum_j \alpha_j (1 + \beta \cdot k_j)} $$
+        *Intuition:* $\beta$ (boost) amplifies categories where exact domain keywords $k_i$ are found in the query, grounding the semantic similarity in explicit terminology.
+
+        **Stage 5: Concentration & Routing Depth**
+        $$ H(\mathbf{W}) = -\sum_{i=1}^{N} \alpha_i^{\text{final}} \log(\alpha_i^{\text{final}}), \quad c = 1 - \frac{H(\mathbf{W})}{\log N} $$
+        *Intuition:* $c \in [0, 1]$ measures category dominance. $c \to 1$ implies a single major category (specialized routing, depth $K=4$). $c \to 0$ implies a plural query (broad routing, depth $K=2$). Here $N$ is the number of active QDWA pillars (currently 5).
+        """)
+        st.markdown(f"""
+        | Parameter | Current Value | Meaning |
+        |-----------|-------|---------|
+        | τ (temperature) | {qdwa.temperature} | Low → sharper distribution |
+        | β (boost) | {qdwa.keyword_boost} | Per-keyword-hit multiplier |
+        | $k_i$ (keyword hits) | {dict(qdwa.keyword_hits)} | Exact matches in category $i$ |
+        | $c$ (concentration) | {c:.3f} | Dominance index |
+        """)
+
+    csv = df.drop(columns=["Color"]).to_csv(index=False)
+    st.download_button("⬇️ Download weights CSV", csv.encode("utf-8"),
+                       file_name=f"qdwa_weights_{hashlib.md5(query.encode()).hexdigest()[:8]}.csv",
+                       mime="text/csv")
+
+
+# ============================================================================
+# LLM QUERY PANEL (Sidebar)
+# ============================================================================
+def render_llm_query_panel(ontology: Any, expander: DynamicOntologyExpander, full_graph: nx.Graph) -> Optional[QueryAnalysisResult]:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔍 LLM-Guided Query")
+    st.sidebar.caption("Ask a question to dynamically expand the ontology and focus the graph")
+
+    session = QuerySessionManager.get_session()
+    mode = st.sidebar.selectbox("Analysis Engine", ["auto", "fallback", "openai", "local"], index=["auto", "fallback", "openai", "local"].index(session.get("analyzer_mode", "auto")), key="llm_mode_select")
+    session["analyzer_mode"] = mode
+
+    api_key = None
+    if mode in ("auto", "openai"):
+        api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password", value=os.environ.get("OPENAI_API_KEY", ""), key="openai_key_input")
+
+    local_model = None
+    # ---------- Check Ollama status ONCE per render ----------
+    ollama_info = _check_ollama_available()
+    if ollama_info["running"]:
+        st.sidebar.success(
+            f"✅ Ollama server running — {len(ollama_info['models'])} model(s) available"
+        )
+    else:
+        st.sidebar.warning(
+            f"⚠️ Ollama unavailable: {ollama_info.get('error', 'unknown')}"
+        )
+
+    st.sidebar.markdown("#### 🖥️ Local LLM Model")
+    st.sidebar.caption(
+        "🟢/🟡 Ollama models auto-detected from local server.  "
+        "🔵 HuggingFace direct-load models require ~4-bit NF4 VRAM."
+    )
+
+    # ---------- LLM REGISTRY (text-only) ----------
+    LOCAL_LLM_REGISTRY = {
+        # ---- Rule-based (no GPU) ----
+        "Fallback (Rule-based, no LLM)":
+            {"backend": "fallback", "tag": None, "size_gb": 0},
+
+        # ---- Ollama: Sub-1B ----
+        "🟢 [Ollama] qwen2.5:0.5b (397 MB)":
+            {"backend": "ollama", "tag": "qwen2.5:0.5b", "size_gb": 0.39},
+
+        # ---- Ollama: 1–3B ----
+        "🟢 [Ollama] qwen2.5:1.5b (986 MB)":
+            {"backend": "ollama", "tag": "qwen2.5:1.5b", "size_gb": 0.96},
+        "🟢 [Ollama] qwen2.5:3b (1.9 GB)":
+            {"backend": "ollama", "tag": "qwen2.5:3b", "size_gb": 1.9},
+
+        # ---- Ollama: 4–8B ----
+        "🟢 [Ollama] qwen2.5:7b (4.7 GB)":
+            {"backend": "ollama", "tag": "qwen2.5:7b", "size_gb": 4.7},
+        "🟢 [Ollama] llama3:latest (4.7 GB)":
+            {"backend": "ollama", "tag": "llama3:latest", "size_gb": 4.7},
+
+        # ---- Ollama: 9–15B ----
+        "🟡 [Ollama] qwen2.5:14b (9.0 GB)":
+            {"backend": "ollama", "tag": "qwen2.5:14b", "size_gb": 9.0},
+
+        # ---- HuggingFace direct-load (existing) ----
+        "🔵 [HF] DistilGPT-2 (82M, fastest)":
+            {"backend": "hf", "tag": "distilgpt2", "size_gb": 0.3},
+        "🔵 [HF] Qwen2.5-0.5B-Instruct (500M, best JSON)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-0.5B-Instruct", "size_gb": 1.0},
+        "🔵 [HF] Qwen2.5-7B-Instruct (7.6B, high quality)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-7B-Instruct", "size_gb": 5.0},
+        "🔵 [HF] Qwen2.5-14B-Instruct (15B, balanced)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-14B-Instruct", "size_gb": 9.0},
+        "🟠 [HF] Qwen3-30B-A3B-Instruct (MoE 30B/3B active, ~18 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-30B-A3B-Instruct", "size_gb": 18.0},
+        "🔴 [HF] Qwen3-32B-Instruct (dense 32B, ~20 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-32B-Instruct", "size_gb": 20.0},
+    }
+
+    # ---------- LLM model dropdown ----------
+    llm_display_names = list(LOCAL_LLM_REGISTRY.keys())
+    # Default to first Ollama model if available, else fallback
+    default_idx = 0
+    if ollama_info["running"]:
+        for i, name in enumerate(llm_display_names):
+            if "[Ollama]" in name:
+                default_idx = i
+                break
+
+    selected_display = st.sidebar.selectbox(
+        "Select LLM model:", options=llm_display_names, index=default_idx,
+        key="local_model_select",
+    )
+    selected_entry = LOCAL_LLM_REGISTRY[selected_display]
+    backend = selected_entry["backend"]
+    model_tag = selected_entry["tag"]
+
+    # Show availability badge
+    if backend == "ollama":
+        if _ollama_has_model(model_tag):
+            st.sidebar.success(f"✅ `{model_tag}` pulled locally ({selected_entry['size_gb']:.1f} GB)")
+        else:
+            st.sidebar.error(f"❌ `{model_tag}` NOT pulled — run: `ollama pull {model_tag}`")
+    elif backend == "hf":
+        st.sidebar.caption(f"🔵 HuggingFace direct-load (~{selected_entry['size_gb']:.0f} GB VRAM at 4-bit)")
+    else:
+        st.sidebar.caption("🟢 Pure rule-based fallback (no model needed)")
+
+    # Preserve backwards-compat: legacy code reads `local_model` (the HF id)
+    # and `st.session_state['selected_local_model']`.  New code also stores
+    # the backend so the routing block can dispatch correctly.
+    local_model = model_tag
+    st.session_state['selected_local_model'] = model_tag
+    st.session_state['selected_local_backend'] = backend
+
+    # ---------- VLM model dropdown ----------
+    st.sidebar.markdown("#### 👁️ VLM Model (Vision-Language)")
+    st.sidebar.caption(
+        "Used when an image and/or LaTeX notes are attached below.  "
+        "🟢 Ollama VLMs auto-detected; 🔵 HF VLMs require ~4-bit NF4 VRAM."
+    )
+
+    # ---------- VLM REGISTRY (vision + text) ----------
+    LOCAL_VLM_REGISTRY = {
+        # ---- Ollama VLMs: small ----
+        "🟢 [Ollama] qwen3-vl:2b (1.9 GB)":
+            {"backend": "ollama", "tag": "qwen3-vl:2b", "size_gb": 1.9},
+        "🟢 [Ollama] qwen2.5vl:3b (3.2 GB)":
+            {"backend": "ollama", "tag": "qwen2.5vl:3b", "size_gb": 3.2},
+
+        # ---- Ollama VLMs: medium ----
+        "🟢 [Ollama] qwen3-vl:4b (3.3 GB)":
+            {"backend": "ollama", "tag": "qwen3-vl:4b", "size_gb": 3.3},
+        "🟢 [Ollama] blaifa/InternVL3_5:8b (5.7 GB)":
+            {"backend": "ollama", "tag": "blaifa/InternVL3_5:8b", "size_gb": 5.7},
+        "🟢 [Ollama] qwen2.5vl:7b (6.0 GB)":
+            {"backend": "ollama", "tag": "qwen2.5vl:7b", "size_gb": 6.0},
+
+        # ---- HuggingFace direct-load VLMs (existing) ----
+        "🔵 [HF] Qwen2.5-VL-7B-Instruct (~6 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen2.5-VL-7B-Instruct", "size_gb": 6.0},
+        "🟠 [HF] Qwen3-VL-30B-Instruct (~19 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-VL-30B-Instruct", "size_gb": 19.0},
+        "🔴 [HF] Qwen3-VL-32B-Instruct (~20 GB 4-bit)":
+            {"backend": "hf", "tag": "Qwen/Qwen3-VL-32B-Instruct", "size_gb": 20.0},
+    }
+
+    vlm_display_names = list(LOCAL_VLM_REGISTRY.keys())
+    default_vlm_idx = 0
+    if ollama_info["running"]:
+        for i, name in enumerate(vlm_display_names):
+            if "[Ollama]" in name:
+                default_vlm_idx = i
+                break
+
+    selected_vlm_display = st.sidebar.selectbox(
+        "Select VLM model:", options=vlm_display_names, index=default_vlm_idx,
+        key="vlm_model_select",
+    )
+    vlm_entry = LOCAL_VLM_REGISTRY[selected_vlm_display]
+    vlm_backend = vlm_entry["backend"]
+    vlm_tag = vlm_entry["tag"]
+
+    if vlm_backend == "ollama":
+        if _ollama_has_model(vlm_tag):
+            st.sidebar.success(f"✅ `{vlm_tag}` pulled locally ({vlm_entry['size_gb']:.1f} GB)")
+        else:
+            st.sidebar.error(f"❌ `{vlm_tag}` NOT pulled — run: `ollama pull {vlm_tag}`")
+    else:
+        st.sidebar.caption(f"🔵 HuggingFace direct-load (~{vlm_entry['size_gb']:.0f} GB VRAM at 4-bit)")
+
+    # Preserve legacy session-state key for downstream code; also store backend.
+    selected_vlm_model = vlm_tag
+    st.session_state['selected_vlm_model'] = vlm_tag
+    st.session_state['selected_vlm_backend'] = vlm_backend
+
+    # Ollama VLMs default to a 4096-token context window, which is too
+    # small for multi-figure prompts (6 figures + captions + LaTeX
+    # routinely exceed 12k tokens).  Expose a tunable `num_ctx` so users
+    # can raise it live without editing code or rebuilding the model via
+    # a Modelfile.  Only relevant for Ollama-backed VLMs.
+    if vlm_backend == "ollama":
+        st.sidebar.number_input(
+            "VLM context window (tokens):",
+            min_value=4096, max_value=65536, value=16384, step=4096,
+            key="vlm_num_ctx",
+            help=(
+                "Ollama's default is 4096 -- too small for 6 figures. "
+                "16384 fits most 6-figure prompts; raise to 32768 if you "
+                "still see context-overflow warnings (uses more VRAM)."
+            ),
+        )
+
+    # === v6.3: Multi-image + LaTeX/text + physics-JSON uploaders =========
+    st.sidebar.markdown("#### 📎 Attach Context (Optional)")
+    st.sidebar.caption(
+        "Upload up to 6 figures (e.g. Models A–F panels) with auto-generated "
+        "captions and/or LaTeX notes to route the query through the selected "
+        "VLM.  Larger Qwen3-VL variants give better chart/microstructure parsing "
+        "but need ≈19–20 GB VRAM at 4-bit NF4."
+    )
+    uploaded_images = st.sidebar.file_uploader(
+        "🖼️ Upload Multiple Figures (Fig 1, Fig 2, …)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="vlm_multi_image_upload",
+    )
+    uploaded_text = st.sidebar.file_uploader(
+        "📄 LaTeX / Text Notes",
+        type=["tex", "txt", "md"],
+        key="vlm_text_upload",
+    )
+    st.sidebar.markdown("##### 🧬 Model Physics Overrides (v6.3)")
+    st.sidebar.caption(
+        "Optional JSON that extends or overrides the hardcoded "
+        "`NUMERICAL_MODELS_PHYSICS` values for Models A–F. Format: "
+        '`{"Model A": {"s_l_ratio": 5.0, "von_mises_stress_peak_mpa": 480.0}, ...}`'
+    )
+    uploaded_physics = st.sidebar.file_uploader(
+        "Upload model_physics_overrides.json",
+        type=["json"],
+        key="vlm_physics_override_upload",
+    )
+
+    # Load LaTeX / text context --------------------------------------------
+    latex_context = ""
+    if uploaded_text is not None:
+        try:
+            latex_context = uploaded_text.read().decode("utf-8", errors="replace")
+            st.sidebar.success(f"✅ Loaded {len(latex_context)} chars of text/LaTeX.")
+        except Exception as e:
+            st.sidebar.error(f"Failed to read text file: {e}")
+
+    # Load multi-image list with per-figure captions -----------------------
+    image_inputs: List[Any] = []
+    image_captions: List[str] = []
+    if uploaded_images:
+        for i, uploaded in enumerate(uploaded_images):
+            try:
+                img = Image.open(uploaded).convert("RGB")
+                image_inputs.append(img)
+                image_captions.append(f"Figure {i+1}: {uploaded.name}")
+            except Exception as e:
+                st.sidebar.error(f"Failed to load image {uploaded.name}: {e}")
+        if image_inputs:
+            st.sidebar.image(
+                image_inputs,
+                caption=image_captions,
+                width="stretch",
+            )
+
+    # Load model-physics overrides JSON ------------------------------------
+    if uploaded_physics is not None:
+        try:
+            overrides_raw = uploaded_physics.read().decode("utf-8", errors="replace")
+            overrides = json.loads(overrides_raw)
+            if isinstance(overrides, dict):
+                st.session_state["model_physics_overrides"] = overrides
+                st.sidebar.success(
+                    f"✅ Loaded physics overrides for {len(overrides)} model(s)."
+                )
+            else:
+                st.sidebar.error("Physics overrides JSON must be a dict at the top level.")
+        except Exception as e:
+            st.sidebar.error(f"Failed to parse physics overrides JSON: {e}")
+    else:
+        # Keep any previously loaded overrides; do not wipe them on rerun.
+        st.session_state.setdefault("model_physics_overrides", {})
+
+    example_queries = [q for pdef in DENDRITE_RESEARCH_PROBLEMS.values() for q in pdef.example_queries[:1]]
+    selected_example = st.sidebar.selectbox("Or select an example:", [""] + example_queries, key="example_query_select")
+
+    query = st.sidebar.text_area(
+        "Your question about dendrite growth in partitioned electrolytes:",
+        value=st.session_state.get('synced_query', "How does the solid-liquid ratio in random inclusion geometry affect dendrite length and von Mises stress?"),
+        height=100, key="llm_query_input",
+        placeholder="e.g., How does Young's modulus suppress dendrite growth?"
+    )
+
+    submitted = st.sidebar.button("🚀 Analyze & Expand Ontology", type="primary", key="llm_submit")
+    if not submitted or not query.strip():
+        return None
+
+    st.session_state['synced_query'] = query
+    factory = LLMQueryAnalyzerFactory()
+
+    # Route to the VLM if any multimodal context was provided; otherwise fall
+    # back to the standard local/openai/fallback routing.
+    # v6.3: Multi-image path uses `MultiImageVLMQueryAnalyzer` instead of the
+    # single-image `VLMQueryAnalyzer`.  Single-image callers still work via
+    # backwards-compatible kwargs.
+    # v6.4: Ollama VLMs use `OllamaVLMQueryAnalyzer`; HF VLMs use
+    # `MultiImageVLMQueryAnalyzer`.  Selection is driven by the
+    # `selected_vlm_backend` session-state key set in the dropdown above.
+    use_vlm = bool(image_inputs) or bool(latex_context.strip())
+    if use_vlm:
+        vlm_backend_sel = st.session_state.get('selected_vlm_backend', 'hf')
+        vlm_tag_sel = st.session_state.get(
+            'selected_vlm_model', "Qwen/Qwen2.5-VL-7B-Instruct"
+        )
+        # Find the human-readable label for the sidebar info box.
+        vlm_display_label = vlm_tag_sel
+        for _lbl, _entry in LOCAL_VLM_REGISTRY.items():
+            if _entry.get("tag") == vlm_tag_sel:
+                vlm_display_label = _lbl
+                break
+        n_imgs = len(image_inputs)
+        if vlm_backend_sel == "ollama":
+            st.sidebar.info(
+                f"👁️ Using **Ollama VLM** for multimodal analysis:\n\n"
+                f"{vlm_display_label}\n"
+                f"Figures attached: **{n_imgs}** (cap 6)"
+            )
+            analyzer = OllamaVLMQueryAnalyzer(
+                model_tag=vlm_tag_sel,
+                max_images=6,
+                num_ctx=int(st.session_state.get("vlm_num_ctx", 16384)),
+            )
+        else:
+            st.sidebar.info(
+                f"👁️ Using **HF VLM** for multimodal analysis:\n\n"
+                f"{vlm_display_label}\n"
+                f"Figures attached: **{n_imgs}** (cap 6)"
+            )
+            analyzer = MultiImageVLMQueryAnalyzer(model_name=vlm_tag_sel, max_images=6)
+    else:
+        llm_backend_sel = st.session_state.get('selected_local_backend', 'fallback')
+        llm_tag_sel = st.session_state.get('selected_local_model')
+        if llm_backend_sel == "ollama" and llm_tag_sel:
+            st.sidebar.info(f"🖥️ Using **Ollama LLM**: `{llm_tag_sel}`")
+            analyzer = OllamaQueryAnalyzer(model_tag=llm_tag_sel)
+        elif llm_backend_sel == "hf" and llm_tag_sel:
+            st.sidebar.info(f"🖥️ Using **HF LLM**: `{llm_tag_sel}`")
+            analyzer = factory.get_analyzer(
+                mode="local", api_key=api_key, local_model=llm_tag_sel
+            )
+        else:
+            # Honor the explicit top-of-sidebar "Analysis Engine" mode when
+            # no LLM backend is set (e.g. mode='openai' or mode='fallback').
+            analyzer = factory.get_analyzer(
+                mode=mode, api_key=api_key, local_model=local_model
+            )
+
+    if isinstance(analyzer, OllamaQueryAnalyzer):
+        pass  # Already announced above.
+    elif isinstance(analyzer, OllamaVLMQueryAnalyzer):
+        pass  # Already announced above.
+    elif isinstance(analyzer, OpenAIQueryAnalyzer):
+        st.sidebar.info("🤖 Using **OpenAI GPT-4o-mini**")
+    elif isinstance(analyzer, LocalLLMQueryAnalyzer):
+        st.sidebar.info("🖥️ Using **Local LLM (HF)**")
+    elif isinstance(analyzer, MultiImageVLMQueryAnalyzer):
+        pass  # Already announced above.
+    elif isinstance(analyzer, VLMQueryAnalyzer):
+        pass  # Already announced above.
+    else:
+        st.sidebar.info("📋 Using **Rule-based fallback**")
+
+    with st.sidebar.spinner("Analyzing query (VLM/LLM)..."):
+        # Pass multi-image list + captions + LaTeX context through when the
+        # analyzer accepts them (MultiImageVLMQueryAnalyzer /
+        # OllamaVLMQueryAnalyzer); plain text-only analyzers ignore the kwargs.
+        try:
+            if isinstance(analyzer, (MultiImageVLMQueryAnalyzer, OllamaVLMQueryAnalyzer)):
+                analysis = analyzer.analyze_query(
+                    query, ontology,
+                    image_inputs=image_inputs,
+                    image_captions=image_captions,
+                    latex_text=latex_context,
+                )
+            else:
+                # Backwards-compat: single-image path.
+                single_img = image_inputs[0] if image_inputs else None
+                analysis = analyzer.analyze_query(
+                    query, ontology,
+                    image_input=single_img,
+                    latex_text=latex_context,
+                )
+        except TypeError:
+            # Older analyzer signatures don't accept image_input/latex_text.
+            analysis = analyzer.analyze_query(query, ontology)
+    with st.sidebar.spinner("Expanding ontology..."):
+        mutations = expander.apply_query_analysis(analysis, analyzer)
+
+    if hasattr(analyzer, 'unload_model'):
+        analyzer.unload_model()
+    del analyzer
+    gc.collect()
+
+    # Persist the multimodal context for downstream Graph-RAG generation.
+    st.session_state['last_query_image'] = (
+        uploaded_images[0].name if uploaded_images else None
+    )
+    st.session_state['last_query_images'] = [u.name for u in uploaded_images] if uploaded_images else []
+    st.session_state['last_query_latex'] = latex_context
+
+    whitelist = set(analysis.explicitly_mentioned)
+    whitelist.update(analysis.inferred_concepts)
+    whitelist.update(expander.session_concepts_added)
+    whitelist.update(expander.query_bridge_concepts.keys())
+    st.session_state['last_query_analysis'] = analysis
+    st.session_state['last_query_text'] = query
+    st.session_state['last_query_whitelist'] = whitelist
+    st.session_state['last_query_dynamic_concepts'] = expander.session_concepts_added
+    st.session_state['last_query_bridge_concepts'] = expander.query_bridge_concepts
+
+    QuerySessionManager.record_query(query, analysis, mutations)
+
+    st.sidebar.success(f"✅ Analysis complete (confidence: {analysis.confidence:.0%})")
+    st.sidebar.caption(f"Primary problem: **{analysis.primary_problem.value}**")
+    st.sidebar.caption(f"Explicit concepts: {len(analysis.explicitly_mentioned)} | Inferred: {len(analysis.inferred_concepts)}")
+    if mutations["concepts_added"]:
+        st.sidebar.warning(f"🆕 {len(mutations['concepts_added'])} new concept(s) added")
+        for c in mutations["concepts_added"]:
+            st.sidebar.markdown(f"  - `{c['name']}` ({c['type']})")
+    if mutations["bridges_created"]:
+        st.sidebar.info(f"🌉 {len(mutations['bridges_created'])} bridge concept(s) created")
+        for b in mutations["bridges_created"]:
+            st.sidebar.markdown(f"  - `{b['bridge']}` ← `{b['for']}`")
+
+    if analysis is not None and getattr(analysis, "category_weights", None):
+        render_category_weight_gauge(
+            analysis.category_weights, analysis.concentration, container=st.sidebar
+        )
+
+    return analysis
+
+
+def render_mutation_controls(expander: DynamicOntologyExpander) -> None:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧬 Ontology Mutations")
+    stats = expander.stats
+    col1, col2 = st.sidebar.columns(2)
+    col1.metric("Concepts +", stats["concepts_added"])
+    col2.metric("Relations +", stats["relationships_added"])
+    if stats["total_mutations"] > 0:
+        with st.sidebar.expander("📋 Mutation Log", expanded=False):
+            for i, mut in enumerate(expander.mutation_log[-10:], 1):
+                if mut["type"] == "add_concept":
+                    st.sidebar.markdown(f"{i}. ➕ `{mut['concept']}`")
+                elif mut["type"] == "add_relationship":
+                    st.sidebar.markdown(f"{i}. 🔗 `{mut['source']}` → `{mut['target']}`")
+                elif mut["type"] == "create_bridge":
+                    st.sidebar.markdown(f"{i}. 🌉 `{mut['bridge_name']}`")
+        col_undo, col_reset = st.sidebar.columns(2)
+        if col_undo.button("↩️ Undo Last", key="undo_mutation"):
+            undone = expander.undo_last_mutation()
+            if undone:
+                st.sidebar.toast(f"Undone: {undone['type']}")
+                st.rerun()
+        if col_reset.button("🔄 Reset All", key="reset_mutations"):
+            result = expander.reset_to_base()
+            st.sidebar.toast(f"Reset: {result['concepts_removed']} concepts, {result['relationships_removed']} relations removed")
+            st.rerun()
+
+
+def render_query_history() -> None:
+    session = QuerySessionManager.get_session()
+    if not session["query_history"]:
+        return
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("📜 Query History", expanded=False):
+        for i, entry in enumerate(reversed(session["analysis_history"][-10:]), 1):
+            st.sidebar.markdown(f"**{i}.** {entry['query'][:60]}...")
+            st.sidebar.caption(f"  Problem: {entry['primary_problem']} | Type: {entry['query_type']} | Concepts: {entry['concepts_found']}")
+
+
+def render_analysis_details(analysis: QueryAnalysisResult) -> None:
+    if analysis is not None and getattr(analysis, "category_weights", None):
+        render_category_weight_gauge(analysis.category_weights, analysis.concentration)
+
+    st.markdown("## 📊 Query Analysis Results")
+    with st.expander("🧠 Reasoning Chain", expanded=True):
+        for step in analysis.reasoning_chain:
+            st.markdown(f"→ {step}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Primary Problem", analysis.primary_problem.value.replace("_", " "))
+    col2.metric("Query Type", analysis.query_type)
+    col3.metric("Confidence", f"{analysis.confidence:.0%}")
+
+    st.markdown("### Concept Priority Rankings")
+    top = analysis.get_top_concepts(15)
+    if top:
+        df = pd.DataFrame([cp.to_dict() for cp in top])
+        def highlight_row(row):
+            if row.get("explicit", False):
+                return ["background-color: #d4edda"] * len(row)
+            elif row.get("inferred", False):
+                return ["background-color: #fff3cd"] * len(row)
+            return [""] * len(row)
+        st.dataframe(df.style.apply(highlight_row, axis=1), width="stretch")
+
+
+def render_llm_qa_tab(analysis_data: Dict, ontology: Any):
+    st.subheader("🤖 LLM-Guided Graph Q&A")
+    st.markdown("Ask a specific scientific question about dendrite growth in partitioned electrolytes. The system will dynamically expand the ontology, extract a relevant subgraph, and generate a grounded answer using retrieved literature snippets.")
+
+    if "qa_factory" not in st.session_state:
+        st.session_state.qa_factory = LLMQueryAnalyzerFactory()
+    if "qa_expander" not in st.session_state:
+        st.session_state.qa_expander = DynamicOntologyExpander(ontology)
+    if "qa_generator" not in st.session_state:
+        st.session_state.qa_generator = GraphRAGAnswerGenerator(st.session_state.qa_factory.get_analyzer("auto"))
+
+    factory = st.session_state.qa_factory
+    expander = st.session_state.qa_expander
+    generator = st.session_state.qa_generator
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        query = st.text_input("Enter your research question:", placeholder="e.g., How does the solid-liquid ratio in random inclusion geometry affect dendrite length and von Mises stress?")
+    with col2:
+        mode = st.selectbox("Engine", ["auto", "openai", "local", "fallback"], index=0)
+
+    if st.button("🔍 Analyze & Answer", type="primary"):
+        if not query.strip():
+            st.warning("Please enter a query.")
+            return
+
+        local_model = st.session_state.get('selected_local_model')
+        analyzer = factory.get_analyzer(mode=mode, local_model=local_model)
+        generator.analyzer = analyzer
+
+        with st.spinner("🧠 Analyzing query and expanding ontology..."):
+            analysis = analyzer.analyze_query(query, ontology)
+            mutations = expander.apply_query_analysis(analysis, analyzer)
+
+            whitelist = set(analysis.explicitly_mentioned)
+            whitelist.update(analysis.inferred_concepts)
+            whitelist.update(expander.session_concepts_added)
+            whitelist.update(expander.query_bridge_concepts.keys())
+            st.session_state['last_query_analysis'] = analysis
+            st.session_state['last_query_text'] = query
+            st.session_state['last_query_whitelist'] = whitelist
+            st.session_state['last_query_dynamic_concepts'] = expander.session_concepts_added
+            st.session_state['last_query_bridge_concepts'] = expander.query_bridge_concepts
+
+            if st.session_state.get('query_focused_build'):
+                st.success(f"✅ Query analysis complete. Whitelist contains {len(whitelist)} concepts.")
+                if st.button("🔧 Rebuild Graph for This Query", type="primary", key="rebuild_for_query_btn"):
+                    st.session_state['force_rebuild'] = True
+                    st.rerun()
+
+        with st.spinner("🕸️ Extracting priority-guided subgraph..."):
+            full_graph = analysis_data["nx_graph"]
+            extractor = PriorityGuidedSubgraphExtractor(full_graph, ontology, expander)
+            embed_model = analysis_data.get("embed_model")
+            if embed_model is not None:
+                st.session_state['embed_model'] = embed_model
+            query_embedding = None
+            if embed_model is not None:
+                try:
+                    with torch.no_grad():
+                        query_embedding = embed_model.encode(query, convert_to_numpy=True)
+                except Exception:
+                    pass
+            subgraph = extractor.extract(analysis, query_embedding)
+
+        with st.spinner("📚 Retrieving evidence and generating answer..."):
+            answer = generator.generate_ground_response(
+                query=query, analysis=analysis, subgraph=subgraph,
+                concept_abstract_map=analysis_data["concept_abstract_map"],
+                all_texts=analysis_data.get("all_texts", []),
+                max_docs_per_concept=2,
+                latex_context=st.session_state.get('last_query_latex', '')
+            )
+
+        if hasattr(analyzer, 'unload_model'):
+            analyzer.unload_model()
+        del analyzer
+        gc.collect()
+
+        st.markdown("### 💡 Generated Answer")
+        st.markdown(answer)
+        st.markdown("---")
+        st.markdown("### 🕸️ Focused Subgraph Visualization")
+        visualizer = QueryDrivenVisualizer(ontology)
+        html = visualizer.render_pyvis(subgraph, analysis)
+        st.components.v1.html(html, height=600, scrolling=True)
+        with st.expander("🔧 Behind the Scenes: Ontology Mutations & Reasoning"):
+            st.markdown("**Reasoning Chain:**")
+            for step in analysis.reasoning_chain:
+                st.markdown("- " + step)
+            if mutations.get("concepts_added") or mutations.get("bridges_created"):
+                st.markdown("**Dynamic Ontology Updates:**")
+                for c in mutations.get("concepts_added", []):
+                    st.markdown("➕ Added Concept: `" + c['name'] + "` (" + c['type'] + ")")
+                for b in mutations.get("bridges_created", []):
+                    st.markdown("🌉 Created Bridge: `" + b['bridge'] + "` for `" + b['for'] + "`")
+
+
+# ============================================================================
+# QUERY‑DRIVEN VISUALIZER
+# ============================================================================
+class QueryDrivenVisualizer:
+    def __init__(self, ontology: Any):
+        self.ontology = ontology
+        self.type_colors = {
+            "material": "#FF6B6B", "property": "#4ECDC4", "phenomenon": "#FFE66D",
+            "method": "#95E1D3", "parameter": "#F38181", "process": "#AA96DA",
+            "model": "#FCBAD3", "general": "#A8D8EA"
+        }
+
+    def render_pyvis(self, subgraph: nx.Graph, analysis: QueryAnalysisResult, height: str = "700px",
+                     physics_enabled: bool = True,
+                     gravity: float = -800.0,
+                     central_gravity: float = 0.1,
+                     spring_length: float = 120,
+                     spring_strength: float = 0.02,
+                     damping: float = 0.95) -> str:
+        from pyvis.network import Network
+        net = Network(height=height, width="100%", directed=True, notebook=False, cdn_resources="remote")
+        if physics_enabled:
+            net.barnes_hut(
+                gravity=gravity,
+                central_gravity=central_gravity,
+                spring_length=spring_length,
+                spring_strength=spring_strength,
+                damping=damping,
+                overlap=0.1
+            )
+        else:
+            net.set_options('{"physics": {"enabled": false}, "interaction": {"hover": true, "dragNodes": true, "dragView": true, "zoomView": true}}')
+        for node, attrs in subgraph.nodes(data=True):
+            concept_type = attrs.get("concept_type", "general")
+            priority = attrs.get("priority_score", 0.2)
+            is_explicit = attrs.get("is_explicit", False)
+            is_llm_added = attrs.get("is_llm_added", False)
+            size = 15 + priority * 35
+            color = self.type_colors.get(concept_type, "#A8D8EA")
+            if is_explicit:
+                border_width, border_color, shape = 4, "#FF0000", "dot"
+            elif is_llm_added:
+                border_width, border_color, shape = 3, "#00FF00", "diamond"
+            else:
+                border_width, border_color, shape = 1, "#666666", "dot"
+            title = "<b>" + node + "</b><br>Type: " + concept_type + "<br>Priority: " + str(round(priority, 2))
+            if is_llm_added:
+                title += "<br>⚠️ LLM-inferred concept"
+            defn = attrs.get("definition", "")
+            if defn:
+                title += "<br><i>" + defn[:150] + "...</i>"
+            net.add_node(node, label=node.replace("_", " ").title(), size=size, color=color,
+                         border_width=border_width, border_color=border_color, shape=shape,
+                         title=title, font={"size": 10 + priority * 6})
+        for u, v, attrs in subgraph.edges(data=True):
+            color = attrs.get("color", "#888888")
+            width = attrs.get("width", 1.0)
+            highlighted = any(len(p) >= 2 and ((p[0] == u and p[1] == v) or (p[1] == u and p[0] == v)) for p in analysis.highlight_paths)
+            if highlighted:
+                color, width = "#FF0000", max(width, 4.0)
+            net.add_edge(u, v, color=color, width=width,
+                         dashes=attrs.get("style") == "dashed" or attrs.get("inferred", False),
+                         title=u + " → " + v + "<br>Type: " + attrs.get('edge_type','unknown'),
+                         arrows="to")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+            net.save_graph(f.name)
+            return Path(f.name).read_text(encoding='utf-8')
+
+
+# ============================================================================
+# SIDEBAR RENDERING
+# ============================================================================
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.header("⚙️ Configuration v6.1 + QDWA")
+        st.subheader("🎨 Theme")
+        st.session_state['theme'] = st.selectbox(
+            "Color theme:",
+            options=list(THEME_PRESETS.keys()),
+            index=0,
+        )
+        theme = THEME_PRESETS[st.session_state['theme']]
+        st.subheader("🧪 Dendrite Growth Focus Areas")
+        st.markdown(r"- **Structural Geometry:** S/L ratio, layering, stripes, random inclusions, domain size")
+        st.markdown(r"- **Phase Properties:** Order parameters (eta, phi), Young's modulus, Poisson's ratio, ionic conductivity")
+        st.markdown(r"- **Electrochemical Kinetics:** Butler-Volmer, overpotential, ionic concentration, nucleation")
+        st.markdown(r"- **Mechanical Constraints:** Von Mises stress, elastic strain energy, eigenstrain, suppression")
+        st.subheader("🧠 NLP Reasoning Options")
+        st.session_state['use_ontology'] = st.checkbox(
+            "Use ontology-based resolution", value=True,
+            help="Maps synonyms like 'eta', 'phi', 'LLZO' to canonical concepts",
+        )
+        st.session_state['use_embedding_resolution'] = st.checkbox(
+            "Use embedding-based semantic equivalence", value=True,
+            help="Detects semantic similarity >0.85 even for unseen variants",
+        )
+        st.session_state['use_relationship_extraction'] = st.checkbox(
+            "Extract cause-effect relationships", value=True,
+            help="Identifies causal links between dendrite-growth parameters and output metrics",
+        )
+        st.session_state['use_inference'] = st.checkbox(
+            "Enable reasoning-based edge inference", value=True,
+            help="Infers method→property chains even when not co-occurring",
+        )
+        st.session_state['context_window'] = st.slider(
+            "Context window (chars)", 20, 200, 50,
+            help="Window size for context-based disambiguation",
+        )
+        st.subheader("📊 Visualization")
+        st.session_state['viz_backend'] = st.selectbox(
+            "Engine:",
+            ["PyVis (Interactive)", "Plotly 2D", "Plotly 3D", "Text Summary"],
+            index=0,
+        )
+        st.session_state['show_edge_weights'] = st.toggle(
+            "Show edge weights", value=False,
+            help="Display numerical weight labels on graph edges.",
+        )
+        st.session_state['edge_label_mode'] = st.selectbox(
+            "Edge label mode:", ["hover", "threshold", "all"], index=0,
+            help="hover=tooltip only, threshold=top 20% edges, all=all edges",
+        )
+        st.session_state['cmap_name'] = st.selectbox(
+            "Colormap:",
+            options=list(SUPPORTED_COLORMAPS.keys()),
+            index=0,
+        )
+        st.subheader("⚡ Physics & Layout")
+        st.session_state['physics_preset'] = st.selectbox(
+            "Physics preset:",
+            options=list(PHYSICS_PRESETS.keys()),
+            index=0,
+        )
+        preset = PHYSICS_PRESETS[st.session_state['physics_preset']]
+        st.session_state['physics_enabled'] = st.checkbox(
+            "Enable physics", value=(preset["gravity"] != 0),
+        )
+        with st.expander("Advanced Physics Overrides"):
+            st.session_state['adv_damping'] = st.slider(
+                "Damping", 0.05, 0.95, preset["damping"], step=0.05,
+            )
+            st.session_state['adv_gravity'] = st.slider(
+                "Repulsion", -8000, -500, preset["gravity"], step=100,
+            )
+            st.session_state['adv_spring_length'] = st.slider(
+                "Spring length", 40, 300, preset["spring_length"], step=10,
+            )
+            st.session_state['adv_spring_strength'] = st.slider(
+                "Spring strength", 0.01, 0.20,
+                preset["spring_strength"], step=0.01,
+            )
+            st.session_state['adv_central_gravity'] = st.slider(
+                "Central gravity", 0.0, 0.5,
+                preset["central_gravity"], step=0.05,
+            )
+            st.session_state['adv_stabilization'] = st.slider(
+                "Stabilization iter", 0, 5000,
+                preset["stabilization"], step=250,
+            )
+        base_preset = PHYSICS_PRESETS[
+            st.session_state['physics_preset']
+        ].copy()
+        if st.session_state.get('adv_damping') is not None:
+            base_preset["damping"] = st.session_state['adv_damping']
+            base_preset["gravity"] = st.session_state['adv_gravity']
+            base_preset["spring_length"] = st.session_state['adv_spring_length']
+            base_preset["spring_strength"] = st.session_state['adv_spring_strength']
+            base_preset["central_gravity"] = st.session_state['adv_central_gravity']
+            base_preset["stabilization"] = st.session_state['adv_stabilization']
+        st.session_state['effective_physics'] = base_preset
+        st.subheader("📏 Display Limits")
+        col_all1, col_slider1 = st.columns([0.3, 0.7])
+        with col_all1:
+            all_graph = st.checkbox("All", value=True, key="all_graph_chk")
+        with col_slider1:
+            st.session_state['top_n_graph'] = st.slider(
+                "Max nodes", 10, 500, 200, step=10,
+                disabled=all_graph, key="top_n_graph_slider",
+            )
+        if all_graph:
+            st.session_state['top_n_graph'] = 0
+        col_all2, col_slider2 = st.columns([0.3, 0.7])
+        with col_all2:
+            all_sun = st.checkbox("All", value=True, key="all_sun_chk")
+        with col_slider2:
+            st.session_state['top_n_sunburst'] = st.slider(
+                "Max children/category", 10, 100, 40, step=10,
+                disabled=all_sun, key="top_n_sunburst_slider",
+            )
+        if all_sun:
+            st.session_state['top_n_sunburst'] = 0
+        col_all3, col_slider3 = st.columns([0.3, 0.7])
+        with col_all3:
+            all_radar = st.checkbox("All", value=True, key="all_radar_chk")
+        with col_slider3:
+            st.session_state['top_n_radar'] = st.slider(
+                "Top K for radar", 5, 30, 15,
+                disabled=all_radar, key="top_n_radar_slider",
+            )
+        if all_radar:
+            st.session_state['top_n_radar'] = 0
+        st.subheader("🔧 Graph Parameters")
+        st.session_state['min_freq'] = st.slider(
+            "Min concept frequency", 1, 20, 1,
+        )
+        st.session_state['min_words'] = st.slider(
+            "Min words per concept", 2, 5, 2,
+        )
+        st.session_state['sim_threshold'] = st.slider(
+            "Semantic threshold", 0.6, 0.95, 0.85, step=0.05,
+        )
+        st.session_state['cooc_weight'] = st.slider(
+            "Co-occurrence weight", 0.5, 1.0, 0.7, step=0.1,
+        )
+        st.session_state['sem_weight'] = st.slider(
+            "Semantic weight", 0.0, 0.5, 0.2, step=0.1,
+        )
+        st.session_state['inf_weight'] = st.slider(
+            "Inference weight", 0.0, 0.3, 0.1, step=0.05,
+        )
+
+        st.subheader("🔍 Query-Focused Graph Mode")
+        st.checkbox("Build graph only for current query concepts", key="query_focused_build")
+        if st.session_state.get('query_focused_build', False):
+            whitelist = st.session_state.get('last_query_whitelist', set())
+            if whitelist:
+                st.success(f"Will extract {len(whitelist)} focused concepts")
+                if st.session_state.get('batch_mode', False):
+                    st.info("📦 Batch mode compatible — frequency threshold auto‑lowered.")
+                with st.expander("Preview whitelisted concepts"):
+                    st.write(sorted(whitelist))
+            else:
+                st.info("Ask a question in the 🤖 LLM-Guided Q&A tab to generate a whitelist.")
+
+        render_batch_processing_controls()
+
+        st.subheader("📈 Statistics")
+        st.session_state['bootstrap_samples'] = st.slider(
+            "Bootstrap samples", 100, 2000, 500, step=100,
+        )
+        st.session_state['alpha_level'] = st.selectbox(
+            "Significance alpha", [0.01, 0.05, 0.10], index=1,
+        )
+
+        st.markdown("---")
+        st.subheader("🎨 Visualization Customization")
+        st.session_state['enable_node_highlight'] = st.checkbox(
+            "🔍 Enable Node Selection Highlight & Descriptions",
+            value=False,
+            help=(
+                "When enabled, clicking a node highlights connected nodes "
+                "with gold borders and overlays edge weights/relationship descriptions."
+            ),
+        )
+        with st.expander("Node & Label Settings"):
+            st.session_state['node_label_size'] = st.slider(
+                "Node label font size", 8, 24, 12, step=1,
+            )
+            st.session_state['node_label_position'] = st.selectbox(
+                "Node label position",
+                ["center", "top", "bottom", "left", "right"],
+                index=0,
+            )
+            st.session_state['node_font_face'] = st.selectbox(
+                "Node font family",
+                [
+                    "Inter, Segoe UI, Roboto, sans-serif",
+                    "Arial, Helvetica, sans-serif",
+                    "Georgia, serif",
+                    "Courier New, monospace",
+                    "Times New Roman, serif",
+                ],
+                index=0,
+            )
+            st.slider(
+                "Node legend font size", 8, 20, 13, step=1,
+                key="node_legend_font_size",
+            )
+        st.session_state['use_abbreviated_labels'] = st.checkbox(
+            "Use short labels (N1, N2...) for long names",
+            value=False,
+        )
+        if st.session_state['use_abbreviated_labels']:
+            st.session_state['max_label_length'] = st.slider(
+                "Max label length before abbreviation",
+                min_value=2, max_value=50, value=15, step=1,
+            )
+        else:
+            st.session_state['max_label_length'] = 15
+        st.session_state['show_definitions'] = st.checkbox(
+            "📖 Show concept definitions in tooltips",
+            value=True,
+        )
+        st.slider(
+            "Tooltip font size", 10, 20, 13, step=1,
+            key="tooltip_font_size",
+        )
+        with st.expander("Edge Label Settings"):
+            st.session_state['edge_label_size'] = st.slider(
+                "Edge label font size", 6, 18, 10, step=1,
+            )
+            st.session_state['edge_label_color'] = st.color_picker(
+                "Edge label color", value="#000000",
+            )
+            st.session_state['edge_label_position'] = st.selectbox(
+                "Edge label position",
+                ["middle", "top", "bottom", "from", "to"],
+                index=0,
+            )
+        edge_color_value = st.session_state.get('edge_label_color')
+        if not edge_color_value or edge_color_value == '':
+            edge_color_value = '#000000'
+        st.session_state['edge_label_color'] = edge_color_value
+
+        with st.expander("Edge Color Customization"):
+            st.selectbox(
+                "Edge color mode",
+                ["theme", "uniform_grey", "custom"],
+                index=0,
+                key="edge_color_mode",
+            )
+            if st.session_state['edge_color_mode'] == "custom":
+                st.color_picker(
+                    "Custom edge color", value="#AAAAAA",
+                    key="custom_edge_color",
+                )
+            else:
+                st.session_state['custom_edge_color'] = "#AAAAAA"
+            st.slider(
+                "Edge lightness (0=original, 1=white)", 0.0, 1.0, 0.6, step=0.05,
+                key="edge_lightness",
+            )
+
+        st.markdown("---")
+        st.subheader("✏️ Graph Editing")
+        with st.expander("Remove Nodes"):
+            if (
+                st.session_state.get('analysis_data')
+                and st.session_state['analysis_data'].get('valid_concepts')
+            ):
+                nodes_to_remove = st.multiselect(
+                    "Select nodes to remove:",
+                    options=st.session_state['analysis_data']['valid_concepts'],
+                    key="remove_nodes_select",
+                )
+                st.session_state['nodes_to_remove'] = nodes_to_remove
+            else:
+                st.info("Build graph first to edit nodes.")
+                st.session_state['nodes_to_remove'] = []
+        with st.expander("Merge Nodes"):
+            if (
+                st.session_state.get('analysis_data')
+                and st.session_state['analysis_data'].get('valid_concepts')
+            ):
+                nodes_to_merge = st.multiselect(
+                    "Select nodes to merge:",
+                    options=st.session_state['analysis_data']['valid_concepts'],
+                    key="merge_nodes_select",
+                )
+                merge_name = st.text_input(
+                    "New merged concept name:", key="merge_name_input",
+                )
+                st.session_state['nodes_to_merge'] = nodes_to_merge
+                st.session_state['merge_name'] = merge_name
+            else:
+                st.info("Build graph first to merge nodes.")
+                st.session_state['nodes_to_merge'] = []
+                st.session_state['merge_name'] = ""
+        with st.expander("Add Edge"):
+            if (
+                st.session_state.get('analysis_data')
+                and st.session_state['analysis_data'].get('valid_concepts')
+            ):
+                all_concepts = st.session_state['analysis_data']['valid_concepts']
+                edge_u = st.selectbox(
+                    "Source concept:", options=all_concepts, key="edge_u_select",
+                )
+                edge_v = st.selectbox(
+                    "Target concept:", options=all_concepts, key="edge_v_select",
+                )
+                edge_weight = st.number_input(
+                    "Edge weight:", min_value=0.1, max_value=10.0,
+                    value=1.0, step=0.1, key="edge_weight_input",
+                )
+                st.session_state['new_edge'] = (
+                    (edge_u, edge_v) if edge_u != edge_v else None
+                )
+                st.session_state['new_edge_weight'] = edge_weight
+            else:
+                st.info("Build graph first to add edges.")
+                st.session_state['new_edge'] = None
+                st.session_state['new_edge_weight'] = 1.0
+        with st.expander("Filter by Degree/Frequency"):
+            st.session_state['filter_min_degree'] = st.slider(
+                "Min degree", 0, 20, 0, key="filter_degree_slider",
+            )
+            st.session_state['filter_min_freq'] = st.slider(
+                "Min frequency", 0, 50, 0, key="filter_freq_slider",
+            )
+        if (
+            st.session_state.get('analysis_data')
+            and st.session_state['analysis_data'].get('valid_concepts')
+        ):
+            if st.button("Apply Graph Edits", key="apply_edits_btn"):
+                st.session_state['apply_edits'] = True
+        if (
+            st.session_state.get('analysis_data')
+            and st.session_state.get('edit_history')
+        ):
+            col_undo, col_redo = st.columns(2)
+            with col_undo:
+                if (
+                    st.button("↩️ Undo", key="undo_btn")
+                    and st.session_state['edit_history'].can_undo()
+                ):
+                    snapshot = st.session_state['edit_history'].undo()
+                    if snapshot:
+                        st.session_state['analysis_data']['nx_graph'] = snapshot['nx_graph']
+                        st.session_state['analysis_data']['valid_concepts'] = snapshot['valid_concepts']
+                        st.session_state['analysis_data']['concept_to_id'] = snapshot['concept_to_id']
+                        st.session_state['analysis_data']['id_to_concept'] = snapshot['id_to_concept']
+                        st.session_state['analysis_data']['concept_abstract_map'] = snapshot['concept_abstract_map']
+                        st.success("Undo applied!")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
+            with col_redo:
+                if (
+                    st.button("↪️ Redo", key="redo_btn")
+                    and st.session_state['edit_history'].can_redo()
+                ):
+                    snapshot = st.session_state['edit_history'].redo()
+                    if snapshot:
+                        st.session_state['analysis_data']['nx_graph'] = snapshot['nx_graph']
+                        st.session_state['analysis_data']['valid_concepts'] = snapshot['valid_concepts']
+                        st.session_state['analysis_data']['concept_to_id'] = snapshot['concept_to_id']
+                        st.session_state['analysis_data']['id_to_concept'] = snapshot['id_to_concept']
+                        st.session_state['analysis_data']['concept_abstract_map'] = snapshot['concept_abstract_map']
+                        st.success("Redo applied!")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
+
+        st.markdown("---")
+        st.subheader("☀️ Sunburst Chart Customization")
+        st.session_state['sunburst_cmap'] = st.selectbox(
+            "Colormap:",
+            options=[
+                "viridis", "plasma", "inferno", "magma", "cividis",
+                "turbo", "rainbow", "hsv", "coolwarm", "RdBu", "Spectral",
+                "tab10", "tab20", "Pastel1", "Set1", "Set2", "Set3",
+                "YlOrRd", "PuBuGn", "GnBu", "YlGnBu",
+            ],
+            index=0,
+            key="sunburst_cmap_select",
+        )
+        st.session_state['sunburst_font_family'] = st.selectbox(
+            "Sunburst font family",
+            [
+                "Arial, sans-serif",
+                "Inter, Segoe UI, Roboto, sans-serif",
+                "Georgia, serif",
+                "Courier New, monospace",
+                "Times New Roman, serif",
+            ],
+            index=0,
+            key="sunburst_font_family_select",
+        )
+        col_labels, col_values = st.columns(2)
+        with col_labels:
+            st.session_state['sunburst_show_labels'] = st.checkbox(
+                "Show symbols", value=True,
+                key="sunburst_show_labels_chk",
+            )
+        with col_values:
+            st.session_state['sunburst_show_values'] = st.checkbox(
+                "Show values", value=False,
+                key="sunburst_show_values_chk",
+            )
+        st.session_state['sunburst_hover_info'] = st.selectbox(
+            "Hover information:",
+            options=["all", "minimal", "none"],
+            index=0,
+            key="sunburst_hover_select",
+        )
+        st.session_state['sunburst_branchvalues'] = st.selectbox(
+            "Branch values mode:", ["total", "remainder"], index=0,
+            key="sunburst_branch_mode",
+        )
+        col_w, col_h = st.columns(2)
+        with col_w:
+            st.session_state['sunburst_width'] = st.slider(
+                "Chart width (px)", 600, 1400, 900, step=50,
+                key="sunburst_width_slider",
+            )
+        with col_h:
+            st.session_state['sunburst_height'] = st.slider(
+                "Chart height (px)", 500, 1200, 700, step=50,
+                key="sunburst_height_slider",
+            )
+        st.session_state['sunburst_label_size'] = st.slider(
+            "Symbol font size", 8, 30, 20, step=1,
+            key="sunburst_label_size_slider",
+        )
+        st.slider(
+            "Sunburst legend font size", 8, 20, 12, step=1,
+            key="sunburst_legend_font_size",
+        )
+        st.session_state['sunburst_show_legend'] = st.checkbox(
+            "Show symbol legend", value=True,
+            key="sunburst_show_legend_chk",
+        )
+        if (
+            st.session_state.get('analysis_data')
+            and st.session_state['analysis_data'].get('valid_concepts')
+        ):
+            all_cats = list(set(
+                categorize_dendrite_concept(c) for c in st.session_state['analysis_data']['valid_concepts']
+            ))
+            st.session_state['sunburst_categories'] = st.multiselect(
+                "Filter categories:", options=all_cats,
+                default=all_cats, key="sunburst_cat_filter",
+            )
+        else:
+            st.info("Build graph first to filter categories.")
+            st.session_state['sunburst_categories'] = []
+
+        st.markdown("---")
+        with st.expander("⚡ Performance Monitor"):
+            if st.button("Show Timing Report"):
+                report = PerformanceMonitor.get_report()
+                if report:
+                    st.code(report, language="text")
+                else:
+                    st.info("No timing data yet. Run analysis first.")
+            if st.button("Reset Timings"):
+                PerformanceMonitor.reset()
+                st.success("Timing data reset!")
+
+        st.markdown("---")
+        if st.button("🗑️ Clear Cache"):
+            st.cache_resource.clear()
+            st.cache_data.clear()
+            gc.collect()
+            st.success("Cache cleared!")
+        gpu_info = "CUDA" if torch.cuda.is_available() else "CPU"
+        st.caption(f"Device: {gpu_info}")
+
+        st.markdown("---")
+        st.subheader("🔍 LLM-Guided Query (Pre-Build Scope)")
+        st.caption("Ask a question BEFORE building to narrow the concept scope")
+
+        ontology = st.session_state.ontology
+        expander = st.session_state.qa_expander
+
+        full_graph = (
+            st.session_state.analysis_data.get("nx_graph")
+            if st.session_state.get("analysis_data")
+            else nx.Graph()
+        )
+
+        render_llm_query_panel(ontology, expander, full_graph)
+        render_mutation_controls(expander)
+        render_query_history()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main() -> None:
+    st.title("🧪 Dendrite Growth in Partitioned Electrolytes Concept Graph v6.3 + QDWA + Numerical Models")
+    st.caption(
+        "Multi-level reasoning concept graph for dendrite growth in partitioned electrolytes | "
+        "Focus: Structural geometry, phase properties, electrochemical kinetics, mechanical constraints, "
+        "and numerical-model physics (Models A–F) | "
+        "Memory-Safe | Batch Processing (≤ 1 GB) | Interactive Visualization | "
+        "Ontology-aware resolution | Query Distillation & Weighted Allocation (QDWA, 5-pillar) | "
+        "Multi-Image VLM | Model↔Abstract Association"
+    )
+
+    # v6.2 FIX: seed widget keys BEFORE any widget (sidebar or tab) is rendered.
+    # This is the only legal moment to write to a widget-backed session key.
+    init_widget_defaults()
+
+    if 'ontology' not in st.session_state:
+        st.session_state.ontology = DomainOntology()
+    ontology = st.session_state.ontology
+
+    if 'qa_factory' not in st.session_state:
+        st.session_state.qa_factory = LLMQueryAnalyzerFactory()
+    if 'qa_expander' not in st.session_state:
+        st.session_state.qa_expander = DynamicOntologyExpander(ontology)
+    if 'qa_generator' not in st.session_state:
+        st.session_state.qa_generator = GraphRAGAnswerGenerator(st.session_state.qa_factory.get_analyzer("auto"))
+
+    render_sidebar()
+
+    if "analysis_data" not in st.session_state:
+        st.session_state.analysis_data = None
+    if "input_hash" not in st.session_state:
+        st.session_state.input_hash = None
+    if "apply_edits" not in st.session_state:
+        st.session_state.apply_edits = False
+    if "edit_history" not in st.session_state:
+        st.session_state.edit_history = GraphEditHistory()
+    if "burst_df" not in st.session_state:
+        st.session_state.burst_df = None
+    if "drift_df" not in st.session_state:
+        st.session_state.drift_df = None
+    if "genealogy_df" not in st.session_state:
+        st.session_state.genealogy_df = None
+    if "bridge_df" not in st.session_state:
+        st.session_state.bridge_df = None
+    if "motifs" not in st.session_state:
+        st.session_state.motifs = {}
+    if "last_query_analysis" not in st.session_state:
+        st.session_state.last_query_analysis = None
+    if "last_query_text" not in st.session_state:
+        st.session_state.last_query_text = ""
+    if "last_query_whitelist" not in st.session_state:
+        st.session_state.last_query_whitelist = set()
+    if "last_query_dynamic_concepts" not in st.session_state:
+        st.session_state.last_query_dynamic_concepts = set()
+    if "last_query_bridge_concepts" not in st.session_state:
+        st.session_state.last_query_bridge_concepts = {}
+    if "query_focused_build" not in st.session_state:
+        st.session_state.query_focused_build = False
+
+    st.header("📁 Data Loading")
+    st.info(f"Place JSON/BibTeX/CSV files in: `{JSON_METADATA_DIR}`")
+    with st.spinner("Scanning json_metadatabase..."):
+        file_records = load_all_json_files(JSON_METADATA_DIR)
+        df = build_master_dataframe(file_records)
+
+    if not file_records:
+        st.warning("No .json/.bib/.csv files found in the directory.")
+        st.info("Please place your metadata files in the `json_metadatabase/` folder.")
+        return
+    successful_files = [f for f in file_records if f[1]]
+    if not successful_files:
+        st.error("Files found but none could be parsed. Check error messages above.")
+        return
+    st.success(f"Loaded {len(successful_files)} file(s) | {len(df)} record(s)")
+    file_names = [f[0] for f in successful_files]
+    selected_files = st.multiselect("Filter by source file", file_names, default=file_names)
+    if selected_files:
+        df_filtered = df[df["_source_file"].isin(selected_files)].copy()
+    else:
+        df_filtered = df.copy()
+    st.write(f"Working with **{len(df_filtered)}** records")
+    with st.expander("Preview Data Structure"):
+        st.dataframe(df_filtered.head(5), width="stretch")
+        st.markdown("**Available columns:**")
+        st.write(list(df_filtered.columns))
+
+    text_cols = [
+        c for c in df_filtered.columns
+        if any(k in c.lower() for k in ['abstract', 'title', 'summary', 'text', 'content', 'description'])
+    ]
+    if not text_cols:
+        text_cols = [c for c in df_filtered.columns if df_filtered[c].dtype == 'object']
+    selected_text_cols = st.multiselect(
+        "Select text columns for concept extraction:",
+        options=text_cols,
+        default=text_cols[:2] if len(text_cols) >= 2 else text_cols,
+    )
+    if not selected_text_cols:
+        st.error("Please select at least one text column.")
+        return
+
+    build_clicked = st.button(
+        "🚀 Build Concept Graph with Reasoning",
+        type="primary",
+        width="stretch",
+    )
+
+    force_rebuild = st.session_state.pop("force_rebuild", False)
+    should_build = build_clicked or force_rebuild
+    batch_trigger = st.session_state.pop("batch_trigger", None)
+    batch_mode_on = st.session_state.get("batch_mode", False)
+
+    if batch_mode_on and (should_build or batch_trigger):
+        run_batch_analysis(
+            df_filtered=df_filtered,
+            selected_text_cols=selected_text_cols,
+            ontology=ontology,
+            run_mode=(batch_trigger or "all"),
+        )
+    elif should_build:
+        progress_bar = st.progress(0.0)
+        status = st.status("Initializing advanced NLP analysis...", expanded=True)
+        overall_start = time.perf_counter()
+        try:
+            with status:
+                metrics = get_metrics_logger()
+                metrics.reset()
+                metrics.set("mode", "standard")
+                metrics.set("total_docs", len(df_filtered))
+                live_panel = st.empty()
+
+                st.write("Preparing text corpus...")
+                all_texts = []
+                for idx, row in df_filtered.iterrows():
+                    text = " ".join([str(row[col]) for col in selected_text_cols if col in row and pd.notna(row[col])])
+                    all_texts.append(text)
+                num_abstracts = len(all_texts)
+                st.write(f"Prepared {num_abstracts} documents")
+                progress_bar.progress(0.05)
+
+                st.write("Loading embedding model...")
+                embed_model = load_embedding_model()
+                st.success("Embedding model loaded")
+                progress_bar.progress(0.10)
+
+                config = get_adaptive_config(num_abstracts)
+                config["MIN_CONCEPT_FREQ"] = st.session_state.get('min_freq', 5)
+                config["MIN_CONCEPT_LENGTH_WORDS"] = st.session_state.get('min_words', 2)
+                config["SIMILARITY_THRESHOLD"] = st.session_state.get('sim_threshold', 0.85)
+                config["COOCCURRENCE_WEIGHT"] = st.session_state.get('cooc_weight', 0.7)
+                config["SEMANTIC_WEIGHT"] = st.session_state.get('sem_weight', 0.2)
+                config["INFERENCE_WEIGHT"] = st.session_state.get('inf_weight', 0.1)
+                progress_bar.progress(0.15)
+
+                whitelist = build_query_whitelist(st.session_state)
+                is_query_focused = st.session_state.get('query_focused_build', False) and whitelist is not None and len(whitelist) > 0
+                if is_query_focused:
+                    st.info(f"🎯 Query-focused build: {len(whitelist)} concepts whitelisted. MIN_CONCEPT_FREQ forced to 1.")
+                    config["MIN_CONCEPT_FREQ"] = 1  # Force 1 so rare but relevant query concepts aren't dropped
+                use_ontology = st.session_state.get('use_ontology', True)
+                use_inference = st.session_state.get('use_inference', True)
+
+                if use_ontology:
+                    st.write("Initializing ontology-based concept resolver...")
+                    resolver = AdvancedConceptResolver(ontology, embed_model)
+                    extractor = EnhancedConceptExtractor(ontology, resolver)
+                    st.session_state.resolver = resolver
+                    st.session_state.extractor = extractor
+                    st.success("Ontology and resolver initialized")
+                else:
+                    resolver = None
+                    extractor = None
+                progress_bar.progress(0.20)
+
+                st.write("Extracting concepts from abstracts (Parallel)...")
+                all_concepts = [None] * len(df_filtered)
+                all_metrics = [None] * len(df_filtered)
+
+                def _process_single_row(idx, row):
+                    text = " ".join([str(row[col]) for col in selected_text_cols if col in row and pd.notna(row[col])])
+                    if use_ontology and extractor is not None:
+                        concepts = extractor.extract_from_text(
+                            text, idx, allowed_concepts=whitelist
+                        )
+                    else:
+                        concepts = extract_dendrite_concepts_from_text(text)
+                        if whitelist is not None:
+                            concepts = [c for c in concepts if c in whitelist]
+                    doc_metrics: Dict[str, Any] = {}
+                    gpa_matches = re.findall(r'(\d+(?:\.\d+)?)\s*gpa', text, re.I)
+                    if gpa_matches: doc_metrics['youngs_modulus_gpa'] = [float(m) for m in gpa_matches]
+                    mv_matches = re.findall(r'(\d+(?:\.\d+)?)\s*mv\b', text, re.I)
+                    if mv_matches: doc_metrics['overpotential_mv'] = [float(m) for m in mv_matches]
+                    um_matches = re.findall(r'(\d+(?:\.\d+)?)\s*(?:µm|um|micron)s?', text, re.I)
+                    if um_matches: doc_metrics['dendrite_length_um'] = [float(m) for m in um_matches]
+                    ratio_matches = re.findall(r'(\d+(?:\.\d+)?)\s*[:/]\s*(\d+(?:\.\d+)?)', text)
+                    if ratio_matches: doc_metrics['ratios'] = [float(a) / float(b) if float(b) != 0 else 0.0 for a, b in ratio_matches]
+                    return idx, concepts, doc_metrics
+
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {executor.submit(_process_single_row, idx, row): idx for idx, row in df_filtered.iterrows()}
+                    completed = 0
+                    total = len(futures)
+                    for future in as_completed(futures):
+                        idx, concepts, doc_metrics = future.result()
+                        all_concepts[idx] = concepts
+                        all_metrics[idx] = doc_metrics
+                        completed += 1
+                        if completed % 10 == 0 or completed == total:
+                            progress_bar.progress(0.20 + (completed / total) * 0.15)
+                            st.write(f"Extracted {completed}/{total} documents...")
+
+                all_concepts = [c if c is not None else [] for c in all_concepts]
+                all_metrics = [m if m is not None else {} for m in all_metrics]
+
+                if use_ontology and extractor is not None:
+                    concept_freq = extractor.get_concept_frequencies()
+                    valid_concepts = [c for c, f in concept_freq.items() if f >= config.get("MIN_CONCEPT_FREQ", 2)]
+                    if whitelist is not None:
+                        valid_concepts = [c for c in valid_concepts if c in whitelist]
+                    concept_abstract_map = defaultdict(list)
+                    for doc_idx, concepts in enumerate(all_concepts):
+                        for c in set(concepts): concept_abstract_map[c].append(doc_idx)
+                else:
+                    concept_freq = defaultdict(int)
+                    for concepts in all_concepts:
+                        for c in concepts: concept_freq[c] += 1
+                    valid_concepts = [c for c, f in concept_freq.items() if f >= config.get("MIN_CONCEPT_FREQ", 2)]
+                    if whitelist is not None:
+                        valid_concepts = [c for c in valid_concepts if c in whitelist]
+                    concept_abstract_map = defaultdict(list)
+                    for doc_idx, concepts in enumerate(all_concepts):
+                        for c in set(concepts): concept_abstract_map[c].append(doc_idx)
+
+                valid_concepts = sorted(valid_concepts, key=lambda c: len(concept_abstract_map.get(c, [])), reverse=True)
+                top_n = config.get("TOP_N_CONCEPTS", 1000)
+                if len(valid_concepts) > top_n: valid_concepts = valid_concepts[:top_n]
+                concept_to_id = {c: i for i, c in enumerate(valid_concepts)}
+                id_to_concept = {i: c for i, c in enumerate(valid_concepts)}
+                progress_bar.progress(0.45)
+
+                metrics.start_step("Concept extraction")
+                metrics.end_step({"concepts_found": len(valid_concepts)})
+                render_live_metrics_panel(metrics, live_panel)
+
+                if len(valid_concepts) < 5:
+                    st.error("Too few concepts extracted. Try lowering frequency thresholds.")
+                    return
+
+                metrics.start_step("Graph construction")
+                st.write("Building concept graph...")
+                if use_ontology and use_inference:
+                    graph_builder = ReasoningEnhancedGraphBuilder(ontology, extractor)
+                    nx_graph = graph_builder.build_graph(all_concepts, valid_concepts, concept_to_id, embed_model, config)
+                else:
+                    nx_graph = build_hybrid_graph(all_concepts, valid_concepts, concept_to_id, embed_model, config, ontology)
+
+                metrics.end_step({"nodes": len(valid_concepts), "edges": nx_graph.number_of_edges()})
+                render_live_metrics_panel(metrics, live_panel)
+
+                pos_pairs, neg_pairs = sample_edges_for_training(nx_graph, valid_concepts, concept_to_id, config)
+                progress_bar.progress(0.55)
+
+                try:
+                    with torch.no_grad():
+                        embeddings = embed_model.encode(valid_concepts, show_progress_bar=False, batch_size=64, convert_to_numpy=True)
+                    node_features = torch.tensor(embeddings, dtype=torch.float32)
+                except Exception:
+                    node_features = torch.randn(len(valid_concepts), 384)
+                progress_bar.progress(0.65)
+
+                def training_progress(epoch, loss):
+                    progress = 0.65 + (epoch / 50) * 0.15
+                    progress_bar.progress(min(1.0, progress))
+
+                metrics.start_step("GNN training")
+                gnn_model, final_emb, adj_indices, adj_values = train_gnn(
+                    node_features, nx_graph, concept_to_id, pos_pairs, neg_pairs, training_progress
+                )
+                metrics.end_step({"embedding_dim": final_emb.shape[1] if hasattr(final_emb, 'shape') else 0})
+                render_live_metrics_panel(metrics, live_panel)
+                progress_bar.progress(0.80)
+
+                concept_properties = {}
+                for concept in valid_concepts:
+                    doc_indices = concept_abstract_map.get(concept, [])
+                    values = []
+                    for idx in doc_indices:
+                        if idx < len(all_metrics):
+                            metric_dict = all_metrics[idx]
+                            if metric_dict:
+                                for metric_values in metric_dict.values(): values.extend(metric_values)
+                    concept_properties[concept] = float(np.median(values)) if values else 0.0
+
+                X_feat, y_target = [], []
+                for u, v in nx_graph.edges():
+                    pu, pv = concept_properties.get(u, 0), concept_properties.get(v, 0)
+                    w = nx_graph[u][v].get('weight', 1)
+                    X_feat.append([pu, pv, w])
+                    y_target.append(max(pu, pv) * 1.08 if max(pu, pv) > 0 else 0)
+                ridge = Ridge(alpha=1.0).fit(np.array(X_feat), np.array(y_target)) if len(X_feat) > 5 else None
+
+                top_scores = compute_research_direction_scores(
+                    gnn_model, node_features, final_emb, nx_graph, valid_concepts, concept_properties, ridge, embed_model
+                )
+                distill_df = compute_concept_distillation(valid_concepts, concept_abstract_map, all_texts)
+
+                burst_df = detect_keyword_bursts(df_filtered, valid_concepts, concept_abstract_map, selected_text_cols)
+                drift_df = detect_semantic_drift(df_filtered, valid_concepts, concept_abstract_map, selected_text_cols)
+                genealogy_df = build_concept_genealogy(nx_graph, valid_concepts, concept_abstract_map)
+                bridge_df = detect_cross_domain_bridges(nx_graph, valid_concepts, concept_abstract_map)
+                motifs = analyze_network_motifs(nx_graph)
+
+                st.session_state.burst_df = burst_df
+                st.session_state.drift_df = drift_df
+                st.session_state.genealogy_df = genealogy_df
+                st.session_state.bridge_df = bridge_df
+                st.session_state.motifs = motifs
+
+                total_time = time.perf_counter() - overall_start
+                metrics.set("total_runtime_s", total_time)
+                status.update(label=f"Analysis complete! ({total_time:.1f}s)", state="complete", expanded=False)
+                log_path = metrics.save_log()
+                st.caption(f"📊 Metrics log saved: `{log_path}`")
+
+                analysis_data = {
+                    "valid_concepts": valid_concepts, "concept_to_id": concept_to_id,
+                    "id_to_concept": id_to_concept, "concept_abstract_map": concept_abstract_map,
+                    "nx_graph": nx_graph, "concept_properties": concept_properties,
+                    "ridge": ridge, "top_scores": top_scores, "distill_df": distill_df,
+                    "gnn_model": gnn_model, "final_emb": final_emb, "embed_model": embed_model,
+                    "all_metrics": all_metrics, "all_texts": all_texts, "config": config,
+                    "df_filtered": df_filtered, "selected_text_cols": selected_text_cols,
+                }
+                if use_ontology:
+                    analysis_data.update({
+                        "ontology": ontology, "resolver": resolver, "extractor": extractor,
+                        "graph_builder": graph_builder if use_inference else None,
+                        "reasoning_paths": graph_builder.reasoning_paths if use_inference else [],
+                    })
+                st.session_state.analysis_data = analysis_data
+                st.session_state.edit_history = GraphEditHistory()
+                st.session_state.edit_history.save_snapshot(nx_graph, valid_concepts, concept_to_id, id_to_concept, concept_abstract_map)
+
+        except Exception as e:
+            st.error(f"Pipeline Error: {e}")
+            with st.expander("Traceback"): st.code(traceback.format_exc())
+            return
+        finally:
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # --- APPLY GRAPH EDITS ---
+    if st.session_state.get('apply_edits') and st.session_state.analysis_data is not None:
+        data = st.session_state.analysis_data
+        st.session_state.edit_history.save_snapshot(
+            data["nx_graph"], data["valid_concepts"], data["concept_to_id"], data["id_to_concept"], data["concept_abstract_map"]
+        )
+        nx_graph, valid_concepts, concept_to_id, id_to_concept, concept_abstract_map, edited = apply_graph_edits(
+            data["nx_graph"], data["valid_concepts"], data["concept_to_id"], data["id_to_concept"], data["concept_abstract_map"],
+            nodes_to_remove=st.session_state.get('nodes_to_remove', []),
+            nodes_to_merge=st.session_state.get('nodes_to_merge', []),
+            merge_name=st.session_state.get('merge_name', None),
+            new_edge=st.session_state.get('new_edge', None),
+            new_edge_weight=st.session_state.get('new_edge_weight', 1.0),
+            min_degree=st.session_state.get('filter_min_degree', 0),
+            min_freq=st.session_state.get('filter_min_freq', 0),
+        )
+        if edited:
+            st.session_state.analysis_data["nx_graph"] = nx_graph
+            st.session_state.analysis_data["valid_concepts"] = valid_concepts
+            st.session_state.analysis_data["concept_to_id"] = concept_to_id
+            st.session_state.analysis_data["id_to_concept"] = id_to_concept
+            st.session_state.analysis_data["concept_abstract_map"] = concept_abstract_map
+            st.session_state['apply_edits'] = False
+            st.rerun()
+
+    # --- DISPLAY RESULTS ---
+    if st.session_state.analysis_data is not None:
+        data = st.session_state.analysis_data
+        valid_concepts = data["valid_concepts"]
+        concept_abstract_map = data["concept_abstract_map"]
+        nx_graph = data["nx_graph"]
+        top_scores = data["top_scores"]
+        distill_df = data["distill_df"]
+        df_filtered = data.get("df_filtered", pd.DataFrame())
+        selected_text_cols = data.get("selected_text_cols", [])
+        cmap = st.session_state.get('cmap_name', 'viridis')
+        has_reasoning = "ontology" in data
+
+        tab_names = [
+            "🎯 QDWA Weights",
+            "📊 Visualization",
+            "🧪 Distillation",
+            "🎯 Research Directions",
+            "✅ Validation",
+            "📥 Export",
+            "📈 Extra Viz",
+            "🔬 Advanced Analytics",
+            "🧬 Numerical Models Physics",     # v6.3
+            "🔗 Model-Abstract Association",   # v6.3
+            "🧪 Numerical Model Physics Q&A (MoE)",  # v6.3.3
+        ]
+        if has_reasoning:
+            tab_names.append("🧠 Reasoning Dashboard")
+        tab_names.append("🧠 Microtransformer #2")
+        tab_names.append("🤖 LLM-Guided Q&A")
+        tab_names.append("📊 Computational Metrics")
+        tabs = st.tabs(tab_names)
+
+        # TAB 0: QDWA WEIGHTS
+        with tabs[0]:
+            st.header("🎯 Query Distillation & Weighted Allocation")
+            st.caption("Enter a query about dendrite growth in partitioned electrolytes to see how QDWA allocates relevance weight across the five domain pillars (Structural Geometry, Phase Properties, Electrochemical Kinetics, Mechanical Constraints, and Numerical Models).")
+            encoder = load_embedding_model()
+            ontology = st.session_state.ontology
+            if "qdwa_allocator" not in st.session_state:
+                st.session_state.qdwa_allocator = init_qdwa_allocator(ontology, encoder)
+            qdwa = st.session_state.qdwa_allocator
+
+            qdwa_query = st.text_input(
+                "QDWA Query",
+                value=st.session_state.get('synced_query', "How does the solid-liquid ratio in random inclusion geometry affect dendrite length and von Mises stress?"),
+                key="qdwa_query_input",
+            )
+
+            if not qdwa_query.strip():
+                st.info("Type a query above to compute QDWA weights.")
+            else:
+                render_qdwa_tab(qdwa, qdwa_query.strip(), get_metrics_logger())
+
+        # TAB 1: VISUALIZATION
+        with tabs[1]:
+            st.subheader("Interactive Concept Graph")
+            if nx_graph.number_of_nodes() == 0:
+                st.warning("No nodes to display.")
+            viz_choice = st.session_state.get('viz_backend', 'PyVis (Interactive)')
+            theme = THEME_PRESETS.get(st.session_state.get('theme', 'Bright (Default)'), THEME_PRESETS["Bright (Default)"])
+
+            if viz_choice == "PyVis (Interactive)":
+                render_graph_pyvis(
+                    nx_graph, concept_abstract_map,
+                    physics_enabled=st.session_state.get('physics_enabled', True),
+                    cmap_name=cmap, top_n_nodes=st.session_state.get('top_n_graph', 0),
+                    theme=theme, physics_preset=st.session_state.get('effective_physics', PHYSICS_PRESETS["Stable (Default)"]),
+                    show_edge_weights=st.session_state.get('show_edge_weights', False),
+                    edge_label_mode=st.session_state.get('edge_label_mode', 'hover'),
+                    node_label_size=st.session_state.get('node_label_size') or 12,
+                    node_label_position=st.session_state.get('node_label_position') or 'center',
+                    node_font_face=st.session_state.get('node_font_face') or 'Inter, Segoe UI, Roboto, sans-serif',
+                    edge_label_size=st.session_state.get('edge_label_size') or 10,
+                    edge_label_color=st.session_state.get('edge_label_color') or None,
+                    edge_label_position=st.session_state.get('edge_label_position') or 'middle',
+                    use_abbreviated_labels=st.session_state.get('use_abbreviated_labels', False),
+                    max_label_length=st.session_state.get('max_label_length', 15),
+                    enable_node_highlight=st.session_state.get('enable_node_highlight', False),
+                    show_definitions=st.session_state.get('show_definitions', True),
+                    edge_lightness=st.session_state.get('edge_lightness', 0.6),
+                    edge_color_mode=st.session_state.get('edge_color_mode', 'theme'),
+                    custom_edge_color=st.session_state.get('custom_edge_color', '#AAAAAA'),
+                    tooltip_font_size=st.session_state.get('tooltip_font_size', 13),
+                    node_legend_font_size=st.session_state.get('node_legend_font_size', 13),
+                )
+            elif viz_choice == "Plotly 2D":
+                render_graph_plotly_2d(nx_graph, concept_abstract_map, cmap_name=cmap, top_n_nodes=st.session_state.get('top_n_graph', 0), theme=theme)
+            elif viz_choice == "Plotly 3D":
+                render_graph_plotly_3d(nx_graph, concept_abstract_map, cmap_name=cmap, top_n_nodes=st.session_state.get('top_n_graph', 0), theme=theme)
+            else:
+                render_graph_fallback(nx_graph, concept_abstract_map, theme=theme)
+
+            with st.expander("Graph Metrics"):
+                display_metric_dashboard(compute_graph_metrics(nx_graph), theme=theme)
+            with st.expander("Domain Hierarchy (Sunburst)"):
+                labels, parents, values = build_category_hierarchy(valid_concepts, concept_abstract_map, top_n_per_category=st.session_state.get('top_n_sunburst', 0))
+                render_sunburst_chart(labels, parents, values, cmap_name=st.session_state.get('sunburst_cmap', cmap), theme=theme, branchvalues=st.session_state.get('sunburst_branchvalues', 'total'), label_size=st.session_state.get('sunburst_label_size') or 20, width=st.session_state.get('sunburst_width') or 900, height=st.session_state.get('sunburst_height') or 700, show_labels=st.session_state.get('sunburst_show_labels', True), show_values=st.session_state.get('sunburst_show_values', False), hover_info=st.session_state.get('sunburst_hover_info', 'all'), font_family=st.session_state.get('sunburst_font_family', 'Inter, Segoe UI, Roboto, sans-serif'), legend_font_size=st.session_state.get('sunburst_legend_font_size', 12))
+            with st.expander("Concept Radar"):
+                c_r1, c_r2 = st.columns(2)
+                with c_r1:
+                    radar_label = st.slider("Label size", 8, 24, 12, key="radar_label_slider")
+                with c_r2:
+                    radar_font = st.slider("Tick/Legend size", 8, 20, 11, key="radar_font_slider")
+                radar_k = st.session_state.get('top_n_radar', 15)
+                render_radar_chart(
+                    distill_df,
+                    top_k=radar_k if radar_k > 0 else 15,
+                    cmap_name=st.session_state.get('cmap_name', 'viridis'),
+                    theme=theme,
+                    label_size=radar_label,
+                    font_size=radar_font
+                )
+
+        # TAB 2: Distillation
+        with tabs[2]:
+            st.subheader("Concept Distillation Efficiency")
+            display_df = distill_df.head(st.slider("Show Top N", 10, min(200, len(distill_df)), 50, key="distill_top_n"))
+            st.dataframe(display_df, width="stretch")
+            st.bar_chart(display_df.set_index('concept')[['distillation_efficiency']])
+
+        # TAB 3: Research Directions
+        with tabs[3]:
+            st.subheader("Top Research Direction Recommendations")
+            if not top_scores.empty:
+                st.dataframe(top_scores[['concept_u', 'concept_v', 'composite_score', 'gnn_affinity', 'semantic_novelty', 'expected_property_gain', 'feasibility_score']].head(20), width="stretch")
+
+        # TAB 4: Validation
+        with tabs[4]:
+            st.subheader("Mathematical Validation")
+            val_metrics = validate_graph_metrics(nx_graph, valid_concepts)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Modularity", f"{val_metrics.get('modularity', 0):.3f}")
+            col2.metric("Silhouette", f"{val_metrics.get('silhouette_score', 0):.3f}")
+            col3.metric("Communities", val_metrics.get('n_communities', 0))
+            col4.metric("Significant Edges", val_metrics.get('edge_significant_count', 0))
+
+        # TAB 5: Export
+        with tabs[5]:
+            st.subheader("Export & Post-Processing")
+            if st.button("Generate Markdown Report"):
+                report = generate_analysis_report(nx_graph, valid_concepts, concept_abstract_map, top_scores, distill_df, st.session_state.get('burst_df'), st.session_state.get('drift_df'), st.session_state.get('genealogy_df'), st.session_state.get('bridge_df'), st.session_state.get('motifs'), val_metrics, df_filtered)
+                st.download_button("📄 Download Report", data=report.encode('utf-8'), file_name="dendrite_report.md", mime="text/markdown")
+
+        # TAB 6: Extra Viz
+        with tabs[6]:
+            st.subheader("Extra Visualizations")
+            render_concept_timeline(df_filtered, valid_concepts, concept_abstract_map, theme=theme)
+            render_cooccurrence_heatmap(nx_graph, valid_concepts, concept_abstract_map, theme=theme)
+
+        # TAB 7: Advanced Analytics
+        with tabs[7]:
+            st.subheader("Advanced Analytics")
+            if st.session_state.get('burst_df') is not None:
+                st.dataframe(st.session_state.burst_df.head(20), width="stretch")
+
+        # TAB 8 (v6.3): Numerical Models Physics
+        with tabs[8]:
+            theme = THEME_PRESETS.get(st.session_state.get('theme', 'Bright (Default)'), THEME_PRESETS["Bright (Default)"])
+            render_numerical_models_physics_tab(theme=theme)
+
+        # TAB 9 (v6.3): Model-Abstract Association
+        with tabs[9]:
+            theme = THEME_PRESETS.get(st.session_state.get('theme', 'Bright (Default)'), THEME_PRESETS["Bright (Default)"])
+            st.header("Model ↔ Abstract Association")
+            st.caption(
+                "Computes a 6×N cosine similarity matrix between each numerical "
+                "model's physics text and each loaded abstract's embedding. "
+                "Brighter cells = stronger relevance."
+            )
+            # Build the abstracts list from the analysis_data all_texts cache.
+            all_texts = data.get("all_texts", [])
+            if isinstance(all_texts, dict):
+                abstracts_list = [all_texts.get(i, "") for i in range(max(all_texts.keys()) + 1)] if all_texts else []
+            else:
+                abstracts_list = list(all_texts)
+            if not abstracts_list:
+                st.info("No abstracts available — build the concept graph first.")
+            else:
+                # Cache key incorporates override hash so changes invalidate cache.
+                overrides_hash = hashlib.md5(
+                    json.dumps(st.session_state.get("model_physics_overrides", {}), sort_keys=True, default=str).encode()
+                ).hexdigest()[:8]
+                model_names, sim_matrix, top_per_model = associate_models_with_abstracts(
+                    abstracts_list,
+                    _embed_model_state_key=overrides_hash,
+                )
+                render_model_abstract_association(
+                    sim_matrix=sim_matrix,
+                    model_names=model_names,
+                    top_per_model=top_per_model,
+                    abstracts=abstracts_list,
+                    theme=theme,
+                )
+
+        # TAB 10 (v6.3.3): Numerical Model Physics Q&A (MoE-powered)
+        with tabs[10]:
+            theme = THEME_PRESETS.get(st.session_state.get('theme', 'Bright (Default)'), THEME_PRESETS["Bright (Default)"])
+            render_numerical_model_physics_qa(theme=theme)
+
+        # TAB 11: Reasoning Dashboard (if available)
+        idx = 11
+        if has_reasoning:
+            with tabs[idx]:
+                render_reasoning_dashboard(nx_graph, valid_concepts, data.get("ontology"), data.get("extractor"))
+            idx += 1
+
+        # TAB: Microtransformer #2
+        with tabs[idx]:
+            render_microtransformer_kg_rag_tab(st.session_state.analysis_data, st.session_state.ontology)
+        idx += 1
+
+        # TAB: LLM-Guided Q&A
+        with tabs[idx]:
+            if "ontology" in st.session_state.analysis_data:
+                render_llm_qa_tab(st.session_state.analysis_data, st.session_state.analysis_data["ontology"])
+            else:
+                st.info("Please build the concept graph with ontology enabled first.")
+        idx += 1
+
+        # TAB: Computational Metrics
+        with tabs[idx]:
+            render_metrics_dashboard(get_metrics_logger())
+
+
+if __name__ == "__main__":
+    main()
